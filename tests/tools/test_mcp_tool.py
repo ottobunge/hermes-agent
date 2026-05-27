@@ -1346,6 +1346,20 @@ class TestBuildSafeEnv:
 
         assert result["PATH"] == "/custom/bin"
 
+    def test_nix_runtime_path_is_prepended_to_path(self):
+        """Nix wrapper runtime tools survive MCP subprocess env filtering."""
+        from tools.mcp_tool import _build_safe_env
+
+        fake_env = {
+            "PATH": "/usr/bin:/nix/runtime/bin",
+            "HERMES_NIX_RUNTIME_PATH": "/nix/runtime/bin:/nix/node/bin",
+        }
+        with patch.dict("os.environ", fake_env, clear=True):
+            result = _build_safe_env(None)
+
+        assert result["PATH"] == "/nix/runtime/bin:/nix/node/bin:/usr/bin"
+        assert "HERMES_NIX_RUNTIME_PATH" not in result
+
     def test_none_user_env(self):
         """None user_env still returns safe vars from os.environ."""
         from tools.mcp_tool import _build_safe_env

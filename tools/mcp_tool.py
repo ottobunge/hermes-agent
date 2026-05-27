@@ -308,6 +308,15 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             env[key] = value
     if user_env:
         env.update(user_env)
+
+    nix_runtime_path = os.environ.get("HERMES_NIX_RUNTIME_PATH")
+    if nix_runtime_path:
+        existing_path = env.get("PATH", "")
+        runtime_parts = [part for part in nix_runtime_path.split(os.pathsep) if part]
+        existing_parts = [part for part in existing_path.split(os.pathsep) if part]
+        env["PATH"] = os.pathsep.join(
+            runtime_parts + [part for part in existing_parts if part not in runtime_parts]
+        )
     return env
 
 
