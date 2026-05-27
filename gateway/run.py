@@ -16062,11 +16062,16 @@ class GatewayRunner:
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
-        _progress_reply_to = (
-            event_message_id
-            if source.platform in (Platform.FEISHU, Platform.MATTERMOST) and source.thread_id and event_message_id
-            else None
-        )
+        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
+            # Feishu needs the triggering message as reply target to stay
+            # inside topic threads.
+            _progress_reply_to = event_message_id
+        elif source.platform == Platform.MATTERMOST and source.thread_id:
+            # Mattermost root_id must be the thread root, not an individual
+            # reply post, for tool/progress messages as well as final replies.
+            _progress_reply_to = source.thread_id
+        else:
+            _progress_reply_to = None
 
         async def send_progress_messages():
             if not progress_queue:
