@@ -14782,11 +14782,12 @@ class GatewayRunner:
             if _progress_thread_id == source.thread_id
             else {"thread_id": _progress_thread_id}
         ) if _progress_thread_id else None
-        _progress_reply_to = (
-            event_message_id
-            if source.platform == Platform.FEISHU and source.thread_id and event_message_id
-            else None
-        )
+        if source.platform == Platform.FEISHU and source.thread_id and event_message_id:
+            _progress_reply_to = event_message_id
+        elif source.platform == Platform.MATTERMOST and source.thread_id:
+            _progress_reply_to = source.thread_id
+        else:
+            _progress_reply_to = None
 
         async def send_progress_messages():
             if not progress_queue:
