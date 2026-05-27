@@ -1234,7 +1234,7 @@ def init_agent(
         0, int(_compression_cfg.get("protect_first_n", 3))
     )
     compression_abort_on_summary_failure = str(
-        _compression_cfg.get("abort_on_summary_failure", False)
+        _compression_cfg.get("abort_on_summary_failure", True)
     ).lower() in {"true", "1", "yes"}
 
     # Read optional explicit context_length override for the auxiliary

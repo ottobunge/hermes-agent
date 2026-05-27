@@ -1291,7 +1291,7 @@ class TestCallLlmPaymentFallback:
         return exc
 
     def test_non_payment_error_not_caught(self, monkeypatch):
-        """Non-payment/non-connection errors (500) should NOT trigger fallback."""
+        """Non-capacity errors still re-raise when fallback cannot recover."""
         monkeypatch.setenv("OPENROUTER_API_KEY", "or-key")
 
         primary_client = MagicMock()
@@ -1302,7 +1302,8 @@ class TestCallLlmPaymentFallback:
         with patch("agent.auxiliary_client._get_cached_client",
                     return_value=(primary_client, "google/gemini-3-flash-preview")), \
              patch("agent.auxiliary_client._resolve_task_provider_model",
-                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)):
+                    return_value=("auto", "google/gemini-3-flash-preview", None, None, None)), \
+             patch("agent.auxiliary_client._get_task_retry_waits", return_value=[]):
             with pytest.raises(Exception, match="Internal Server Error"):
                 call_llm(
                     task="compression",
@@ -1333,6 +1334,64 @@ class TestCallLlmPaymentFallback:
                 messages=[{"role": "user", "content": "hello"}],
             )
         # Fallback client should have been used
+        assert fallback_client.chat.completions.create.called
+
+
+class TestCompressionAuxiliaryRetryBeforeFallback:
+    """Compression aux calls retry transient failures before provider fallback."""
+
+    def test_transient_error_retries_same_provider_before_fallback(self):
+        primary_client = MagicMock()
+        ok_response = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="summary response"))
+        ])
+        primary_client.chat.completions.create.side_effect = [
+            TimeoutError("timed out"),
+            ok_response,
+        ]
+
+        fallback = MagicMock()
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "summary-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "summary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_task_retry_waits", return_value=[0.0]), \
+             patch("agent.auxiliary_client._try_payment_fallback", fallback):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result is ok_response
+        assert primary_client.chat.completions.create.call_count == 2
+        fallback.assert_not_called()
+
+    def test_fallback_runs_after_retry_waits_are_exhausted(self):
+        primary_client = MagicMock()
+        primary_client.chat.completions.create.side_effect = TimeoutError("timed out")
+
+        fallback_client = MagicMock()
+        fallback_response = MagicMock(choices=[
+            MagicMock(message=MagicMock(content="fallback summary"))
+        ])
+        fallback_client.chat.completions.create.return_value = fallback_response
+
+        with patch("agent.auxiliary_client._get_cached_client",
+                   return_value=(primary_client, "summary-model")), \
+             patch("agent.auxiliary_client._resolve_task_provider_model",
+                   return_value=("auto", "summary-model", None, None, None)), \
+             patch("agent.auxiliary_client._get_task_retry_waits", return_value=[0.1, 0.2]), \
+             patch("agent.auxiliary_client.time.sleep") as sleep_mock, \
+             patch("agent.auxiliary_client._try_payment_fallback",
+                   return_value=(fallback_client, "fallback-model", "openrouter")):
+            result = call_llm(
+                task="compression",
+                messages=[{"role": "user", "content": "summarize"}],
+            )
+
+        assert result is fallback_response
+        assert primary_client.chat.completions.create.call_count == 3
+        assert [call.args[0] for call in sleep_mock.call_args_list] == [0.1, 0.2]
         assert fallback_client.chat.completions.create.called
 
 

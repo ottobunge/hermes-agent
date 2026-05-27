@@ -881,7 +881,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
-        "abort_on_summary_failure": False,  # When True, auto-compression that fails
+        "abort_on_summary_failure": True,   # When True, auto-compression that fails
                                       # to generate a summary (aux LLM errored / returned
                                       # non-JSON / timed out) aborts entirely instead of
                                       # dropping the middle window with a static
@@ -889,9 +889,9 @@ DEFAULT_CONFIG = {
                                       # preserved unchanged and the session "freezes" at
                                       # its current size until the user runs /compress
                                       # (which bypasses the failure cooldown) or /new.
-                                      # Default False matches historical behavior; set to
-                                      # True if you'd rather pause than silently lose
-                                      # context turns when your aux model is flaky.
+                                      # Default True preserves history. Set to False only
+                                      # if you explicitly prefer the legacy lossy fallback
+                                      # marker over pausing on a flaky aux model.
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
@@ -991,6 +991,8 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "retries": 3,           # retry transient aux failures before fallback/abort
+            "retry_wait_seconds": [5, 15, 30],  # bounded waits between compression retry attempts
             "extra_body": {},
         },
         # Note: session_search no longer uses an auxiliary LLM (PR #27590 —

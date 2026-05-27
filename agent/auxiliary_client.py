@@ -4548,6 +4548,81 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     return default
 
 
+def _get_task_retry_waits(task: str) -> List[float]:
+    """Read bounded retry waits for transient auxiliary task failures.
+
+    ``auxiliary.<task>.retries`` controls how many same-provider retry attempts
+    are made after the first transient failure. ``retry_wait_seconds`` may be a
+    scalar or list; values are clamped to non-negative floats and extended with
+    the last value when fewer waits than retries are provided.
+    """
+    if not task:
+        return []
+    task_config = _get_auxiliary_task_config(task)
+    try:
+        retries = int(task_config.get("retries", 0) or 0)
+    except (TypeError, ValueError):
+        retries = 0
+    retries = max(0, min(retries, 5))
+    if retries <= 0:
+        return []
+
+    raw_waits = task_config.get("retry_wait_seconds", 0)
+    if isinstance(raw_waits, (list, tuple)):
+        values = list(raw_waits)
+    else:
+        values = [raw_waits]
+
+    waits: List[float] = []
+    for raw in values:
+        try:
+            waits.append(max(0.0, float(raw)))
+        except (TypeError, ValueError):
+            waits.append(0.0)
+    if not waits:
+        waits = [0.0]
+    while len(waits) < retries:
+        waits.append(waits[-1])
+    return waits[:retries]
+
+
+def _is_transient_aux_retry_error(exc: Exception) -> bool:
+    """Return True for errors worth retrying on the same auxiliary backend."""
+    status = getattr(exc, "status_code", None) or getattr(getattr(exc, "response", None), "status_code", None)
+    if status in {408, 429, 500, 502, 503, 504}:
+        return True
+    return _is_connection_error(exc) or _is_rate_limit_error(exc)
+
+
+def _create_completion_with_retries_sync(
+    client: Any,
+    kwargs: Dict[str, Any],
+    task: str = None,
+    retry_waits: Optional[List[float]] = None,
+) -> Any:
+    """Create a chat completion, retrying transient aux failures in-place."""
+    waits = _get_task_retry_waits(task) if retry_waits is None else retry_waits
+    attempt = 0
+    while True:
+        try:
+            return client.chat.completions.create(**kwargs)
+        except Exception as exc:
+            if attempt >= len(waits) or not _is_transient_aux_retry_error(exc):
+                raise
+            wait = waits[attempt]
+            attempt += 1
+            logger.warning(
+                "Auxiliary %s: transient failure on attempt %d/%d (%s); retrying in %.1fs",
+                task or "call",
+                attempt,
+                len(waits) + 1,
+                exc,
+                wait,
+            )
+            if wait > 0:
+                time.sleep(wait)
+
+
 def _get_task_extra_body(task: str) -> Dict[str, Any]:
     """Read auxiliary.<task>.extra_body and return a shallow copy when valid."""
     task_config = _get_auxiliary_task_config(task)
@@ -4871,11 +4946,24 @@ def call_llm(
     if _is_anthropic_compat_endpoint(resolved_provider, _client_base):
         kwargs["messages"] = _convert_openai_images_to_anthropic(kwargs["messages"])
 
+    # Providers backed by credential pools have their own faster recovery path
+    # below (rotate/refresh the exhausted credential). Do not sleep-retry the
+    # same stale credential first; that delays recovery and can consume mocked
+    # side effects in tests.
+    _initial_retry_waits = [] if _recoverable_pool_provider(
+        resolved_provider, client, main_runtime=main_runtime
+    ) else None
+
     # Handle unsupported temperature, max_tokens vs max_completion_tokens retry,
     # then payment fallback.
     try:
         return _validate_llm_response(
-            client.chat.completions.create(**kwargs), task)
+            _create_completion_with_retries_sync(
+                client,
+                kwargs,
+                task,
+                retry_waits=_initial_retry_waits,
+            ), task)
     except Exception as first_err:
         if "temperature" in kwargs and _is_unsupported_temperature_error(first_err):
             retry_kwargs = dict(kwargs)
