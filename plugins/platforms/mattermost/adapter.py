@@ -536,7 +536,6 @@ class MattermostAdapter(BasePlatformAdapter):
             return
 
         import mimetypes
-        import aiohttp
         from urllib.parse import unquote as _unquote
 
         CHUNK = 5  # Mattermost post file_ids cap
@@ -567,6 +566,7 @@ class MattermostAdapter(BasePlatformAdapter):
                         if not is_safe_url(image_url):
                             logger.warning("Mattermost: blocked unsafe image URL in batch")
                             continue
+                        import aiohttp
                         try:
                             async with self._session.get(
                                 image_url, timeout=aiohttp.ClientTimeout(total=30)
@@ -596,6 +596,10 @@ class MattermostAdapter(BasePlatformAdapter):
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 }
+                if metadata and self._reply_mode == "thread":
+                    thread_id = metadata.get("thread_id")
+                    if thread_id:
+                        payload["root_id"] = await self._resolve_root_id(str(thread_id))
                 logger.info(
                     "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                     len(file_ids), chunk_idx + 1, len(chunks),
