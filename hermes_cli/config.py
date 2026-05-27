@@ -771,6 +771,7 @@ DEFAULT_CONFIG = {
                                       # 0 for long-running rolling-compaction sessions
                                       # where you want nothing pinned except the
                                       # system prompt + rolling summary + recent tail.
+        "abort_on_summary_failure": True,  # preserve messages if summary LLM fails
     },
 
     # Anthropic prompt caching (Claude via OpenRouter or native Anthropic API).
@@ -870,6 +871,8 @@ DEFAULT_CONFIG = {
             "base_url": "",
             "api_key": "",
             "timeout": 120,        # seconds — compression summarises large contexts; increase for local models
+            "retries": 3,           # retry transient aux failures before fallback/abort
+            "retry_wait_seconds": [5, 15, 30],
             "extra_body": {},
         },
         "session_search": {
