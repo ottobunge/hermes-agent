@@ -351,7 +351,7 @@ class MattermostAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Download an image and upload it as a file attachment."""
         return await self._send_url_as_file(
-            chat_id, image_url, caption, reply_to, "image"
+            chat_id, image_url, caption, reply_to, "image", metadata
         )
 
     async def send_image_file(
@@ -361,10 +361,11 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: object,
     ) -> SendResult:
         """Upload a local image file."""
         return await self._send_local_file(
-            chat_id, image_path, caption, reply_to
+            chat_id, image_path, caption, reply_to, metadata=metadata
         )
 
     async def send_document(
@@ -375,10 +376,11 @@ class MattermostAdapter(BasePlatformAdapter):
         file_name: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: object,
     ) -> SendResult:
         """Upload a local file as a document."""
         return await self._send_local_file(
-            chat_id, file_path, caption, reply_to, file_name
+            chat_id, file_path, caption, reply_to, file_name, metadata=metadata
         )
 
     async def send_voice(
@@ -388,10 +390,11 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: object,
     ) -> SendResult:
         """Upload an audio file."""
         return await self._send_local_file(
-            chat_id, audio_path, caption, reply_to
+            chat_id, audio_path, caption, reply_to, metadata=metadata
         )
 
     async def send_video(
@@ -401,10 +404,11 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str] = None,
         reply_to: Optional[str] = None,
         metadata: Optional[Dict[str, Any]] = None,
+        **kwargs: object,
     ) -> SendResult:
         """Upload a video file."""
         return await self._send_local_file(
-            chat_id, video_path, caption, reply_to
+            chat_id, video_path, caption, reply_to, metadata=metadata
         )
 
     def format_message(self, content: str) -> str:
@@ -428,12 +432,13 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str],
         reply_to: Optional[str],
         kind: str = "file",
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Download a URL and upload it as a file attachment."""
         from tools.url_safety import is_safe_url
         if not is_safe_url(url):
             logger.warning("Mattermost: blocked unsafe URL (SSRF protection)")
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
 
         import aiohttp
 
@@ -451,7 +456,7 @@ class MattermostAdapter(BasePlatformAdapter):
                             await asyncio.sleep(1.5 * (attempt + 1))
                             continue
                     if resp.status >= 400:
-                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+                        return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
                     file_data = await resp.read()
                     ct = resp.content_type or "application/octet-stream"
                     break
@@ -460,22 +465,22 @@ class MattermostAdapter(BasePlatformAdapter):
                     await asyncio.sleep(1.5 * (attempt + 1))
                     continue
                 logger.warning("Mattermost: failed to download %s after %d attempts: %s", url, attempt + 1, exc)
-                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+                return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
 
         if file_data is None:
             logger.warning("Mattermost: download returned no data for %s", url)
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
 
         file_id = await self._upload_file(chat_id, file_data, fname, ct)
         if not file_id:
-            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to)
+            return await self.send(chat_id, f"{caption or ''}\n{url}".strip(), reply_to, metadata=metadata)
 
         payload: Dict[str, Any] = {
             "channel_id": chat_id,
             "message": caption or "",
             "file_ids": [file_id],
         }
-        thread_root = reply_to
+        thread_root = reply_to or (metadata or {}).get("thread_id")
         if thread_root and self._reply_mode == "thread":
             payload["root_id"] = await self._resolve_root_id(str(thread_root))
 
@@ -491,6 +496,7 @@ class MattermostAdapter(BasePlatformAdapter):
         caption: Optional[str],
         reply_to: Optional[str],
         file_name: Optional[str] = None,
+        metadata: Optional[Dict[str, Any]] = None,
     ) -> SendResult:
         """Upload a local file and attach it to a post."""
         import mimetypes
@@ -515,7 +521,7 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         }
-        thread_root = reply_to
+        thread_root = reply_to or (metadata or {}).get("thread_id")
         if thread_root and self._reply_mode == "thread":
             payload["root_id"] = await self._resolve_root_id(str(thread_root))
 
