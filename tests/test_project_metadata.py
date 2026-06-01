@@ -94,6 +94,13 @@ def test_messaging_extra_includes_qrcode_for_weixin_setup():
     assert any(dep.startswith("qrcode") for dep in messaging_extra)
 
 
+def test_anthropic_extra_matches_lazy_dependency_pin():
+    optional_dependencies = _load_optional_dependencies()
+    from tools.lazy_deps import LAZY_DEPS
+
+    assert tuple(optional_dependencies["anthropic"]) == LAZY_DEPS["provider.anthropic"]
+
+
 def test_dingtalk_extra_includes_qrcode_for_qr_auth():
     """DingTalk's QR-code device-flow auth (hermes_cli/dingtalk_auth.py)
     needs the qrcode package."""
