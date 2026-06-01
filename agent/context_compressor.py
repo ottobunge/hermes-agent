@@ -682,7 +682,7 @@ class ContextCompressor(ContextEngine):
         config_context_length: int | None = None,
         provider: str = "",
         api_mode: str = "",
-        abort_on_summary_failure: bool = False,
+        abort_on_summary_failure: bool = True,
     ):
         self.model = model
         self.base_url = base_url
@@ -696,8 +696,8 @@ class ContextCompressor(ContextEngine):
         self.quiet_mode = quiet_mode
         # When True, summary-generation failure aborts compression entirely
         # (returns messages unchanged, sets _last_compress_aborted=True).
-        # When False (default = historical behavior), insert a
-        # deterministic "summary unavailable" handoff and drop the middle window.
+        # When False (legacy behavior), insert a deterministic
+        # "summary unavailable" handoff and drop the middle window.
         self.abort_on_summary_failure = abort_on_summary_failure
 
         self.context_length = get_model_context_length(
@@ -2172,6 +2172,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         """
         # Reset per-call summary failure state — callers inspect these fields
         # after compress() returns to decide whether to surface a warning.
+        original_messages = messages
         self._last_summary_dropped_count = 0
         self._last_summary_fallback_used = False
         self._last_summary_error = None
@@ -2193,7 +2194,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "Cannot compress: only %d messages (need > %d)",
                     n_messages, _min_for_compress,
                 )
-            return messages
+            return original_messages
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
@@ -2228,7 +2229,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     compress_start, compress_end,
                     self._ineffective_compression_count,
                 )
-            return messages
+            return original_messages
 
         turns_to_summarize = messages[compress_start:compress_end]
         # A persisted handoff summary can sit in the protected head after a
@@ -2284,7 +2285,9 @@ This compaction should PRIORITISE preserving all information related to the focu
 
         # If summary generation failed, behavior splits on
         # ``abort_on_summary_failure`` (config: compression.abort_on_summary_failure):
-        #   True  → ABORT compression entirely. Return messages unchanged
+        #   True  → ABORT compression entirely. Return the original messages
+        #           unchanged, including anything the cheap pruning pre-pass
+        #           would otherwise have summarized before the LLM failed,
         #           and set _last_compress_aborted=True so callers can warn
         #           the user and stop the auto-compress retry loop.
         #   False → Fall through to the default fallback path below: insert
@@ -2292,7 +2295,7 @@ This compaction should PRIORITISE preserving all information related to the focu
         #           the middle window.  Records _last_summary_fallback_used /
         #           _last_summary_dropped_count for gateway hygiene to
         #           surface a warning.
-        # Default is False (historical behavior).
+        # Default is True (history-preserving behavior).
         if not summary and self.abort_on_summary_failure:
             n_skipped = compress_end - compress_start
             self._last_summary_dropped_count = 0  # nothing actually dropped
@@ -2306,7 +2309,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "frozen until the next /compress or /new.",
                     n_skipped,
                 )
-            return messages
+            return original_messages
 
         # Phase 4: Assemble compressed message list
         compressed = []
