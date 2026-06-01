@@ -91,9 +91,11 @@ class MattermostAdapter(BasePlatformAdapter):
         self._closing = False
 
         # Reply mode: "thread" to nest replies, "off" for flat messages.
+        # Default to threaded replies so channel mentions start a Mattermost
+        # thread rooted at the triggering post instead of posting at channel root.
         self._reply_mode: str = (
             config.extra.get("reply_mode", "")
-            or os.getenv("MATTERMOST_REPLY_MODE", "off")
+            or os.getenv("MATTERMOST_REPLY_MODE", "thread")
         ).lower()
 
         # Dedup cache (prevent reprocessing)
@@ -286,11 +288,14 @@ class MattermostAdapter(BasePlatformAdapter):
                 "channel_id": chat_id,
                 "message": chunk,
             }
-            # Thread support: reply_to is the root post ID.
-            if reply_to and self._reply_mode == "thread":
+            # Thread support: reply_to is the triggering/root post ID.  Some
+            # gateway paths carry only metadata["thread_id"] (status/progress,
+            # synthetic sends), so accept that as the Mattermost root fallback.
+            thread_root = reply_to or (metadata or {}).get("thread_id")
+            if thread_root and self._reply_mode == "thread":
                 # Ensure root_id points to the thread root, not a reply.
                 # Mattermost rejects non-root post IDs as root_id.
-                resolved_root = await self._resolve_root_id(reply_to)
+                resolved_root = await self._resolve_root_id(str(thread_root))
                 payload["root_id"] = resolved_root
 
             data = await self._api_post("posts", payload)
@@ -470,8 +475,9 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         }
-        if reply_to and self._reply_mode == "thread":
-            payload["root_id"] = await self._resolve_root_id(reply_to)
+        thread_root = reply_to
+        if thread_root and self._reply_mode == "thread":
+            payload["root_id"] = await self._resolve_root_id(str(thread_root))
 
         data = await self._api_post("posts", payload)
         if not data or "id" not in data:
@@ -509,8 +515,9 @@ class MattermostAdapter(BasePlatformAdapter):
             "message": caption or "",
             "file_ids": [file_id],
         }
-        if reply_to and self._reply_mode == "thread":
-            payload["root_id"] = await self._resolve_root_id(reply_to)
+        thread_root = reply_to
+        if thread_root and self._reply_mode == "thread":
+            payload["root_id"] = await self._resolve_root_id(str(thread_root))
 
         data = await self._api_post("posts", payload)
         if not data or "id" not in data:
@@ -596,6 +603,9 @@ class MattermostAdapter(BasePlatformAdapter):
                     "message": "\n".join(caption_parts),
                     "file_ids": file_ids,
                 }
+                thread_root = (metadata or {}).get("thread_id")
+                if thread_root and self._reply_mode == "thread":
+                    payload["root_id"] = await self._resolve_root_id(str(thread_root))
                 logger.info(
                     "Mattermost: sending %d image(s) as single post (chunk %d/%d)",
                     len(file_ids), chunk_idx + 1, len(chunks),
@@ -786,8 +796,12 @@ class MattermostAdapter(BasePlatformAdapter):
         sender_id = post.get("user_id", "")
         sender_name = data.get("sender_name", "").lstrip("@") or sender_id
 
-        # Thread support: if the post is in a thread, use root_id.
-        thread_id = post.get("root_id") or None
+        # Thread support: replies carry root_id, but a channel root post has no
+        # root_id.  Use the post's own id as the root so every Mattermost
+        # channel thread maps to its own Hermes session and bot replies stay in
+        # that thread.  DMs keep their regular one-session-per-DM behavior unless
+        # the user is explicitly replying in an existing Mattermost thread.
+        thread_id = post.get("root_id") or (post_id if channel_type_raw != "D" else None)
 
         # Determine message type.
         file_ids = post.get("file_ids") or []
