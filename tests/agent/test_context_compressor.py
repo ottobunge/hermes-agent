@@ -16,8 +16,15 @@ def compressor():
             protect_first_n=2,
             protect_last_n=2,
             quiet_mode=True,
+            abort_on_summary_failure=False,
         )
         return c
+
+
+def test_context_compressor_defaults_to_preserving_messages_on_summary_failure():
+    with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+        c = ContextCompressor(model="test/model", quiet_mode=True)
+    assert c.abort_on_summary_failure is True
 
 
 class TestShouldCompress:
@@ -104,7 +111,7 @@ class TestCompress:
         # Should keep system message and last N
         assert result[0]["role"] == "system"
         assert compressor.compression_count == 1
-        # Abort flag must NOT fire under the default config.
+        # Abort flag must NOT fire under explicit legacy config.
         assert compressor._last_compress_aborted is False
         assert compressor._last_summary_fallback_used is True
 
@@ -168,7 +175,7 @@ class TestCompress:
 
     def test_compression_increments_count(self, compressor):
         msgs = self._make_messages(10)
-        # Default config (abort_on_summary_failure=False) — fallback path
+        # Legacy config (abort_on_summary_failure=False) — fallback path
         # increments the count even on summary failure.
         compressor.compress(msgs)
         assert compressor.compression_count == 1
@@ -217,7 +224,13 @@ class TestGenerateSummaryNoneContent:
     def test_none_content_in_system_message_compress(self):
         """System message with content=None should not crash during compress."""
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [{"role": "system", "content": None}] + [
             {"role": "user" if i % 2 == 0 else "assistant", "content": f"msg {i}"}
@@ -811,14 +824,20 @@ class TestAuxModelFallbackSurfacedToCallers:
 
 
 class TestSummaryFailureTrackingForGatewayWarning:
-    """Default behavior (compression.abort_on_summary_failure=False):
+    """Legacy behavior (compression.abort_on_summary_failure=False):
     summary-generation failure inserts a static fallback placeholder and
     records dropped count + fallback flag so gateway hygiene & /compress
     can surface a visible warning."""
 
     def test_compress_records_fallback_and_dropped_count_on_summary_failure(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -837,7 +856,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
         assert c._last_summary_fallback_used is True
         assert c._last_summary_dropped_count > 0
         assert c._last_summary_error is not None
-        # Default mode: abort flag must NOT fire.
+        # Legacy mode: abort flag must NOT fire.
         assert c._last_compress_aborted is False
         assert any(
             isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
@@ -967,7 +986,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
         mock_response.choices[0].message.content = "summary text"
 
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=2, protect_last_n=2)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=2,
+                protect_last_n=2,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -992,7 +1017,7 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
 
 class TestAbortOnSummaryFailure:
-    """Opt-in behavior (compression.abort_on_summary_failure=True):
+    """Safe behavior (compression.abort_on_summary_failure=True):
     summary-generation failure ABORTS compression entirely — returns the
     original messages unchanged and sets _last_compress_aborted=True so
     gateway hygiene & /compress can surface a visible warning."""
@@ -1037,6 +1062,48 @@ class TestAbortOnSummaryFailure:
             isinstance(m.get("content"), str) and "Summary generation was unavailable" in m["content"]
             for m in result
         )
+
+    def test_compress_aborts_with_original_messages_after_tool_pruning(self):
+        """Abort mode must preserve the pre-prune history exactly."""
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=0,
+                protect_last_n=2,
+                abort_on_summary_failure=True,
+            )
+        c.tail_token_budget = 1
+        long_tool_output = "important historical output\n" + ("x" * 500)
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "run command"},
+            {
+                "role": "assistant",
+                "content": "calling tool",
+                "tool_calls": [
+                    {
+                        "id": "call-1",
+                        "type": "function",
+                        "function": {"name": "terminal", "arguments": '{"cmd":"run-big"}'},
+                    }
+                ],
+            },
+            {"role": "tool", "tool_call_id": "call-1", "content": long_tool_output},
+            {"role": "user", "content": "middle 1"},
+            {"role": "assistant", "content": "middle 2"},
+            {"role": "user", "content": "tail 1"},
+            {"role": "assistant", "content": "tail 2"},
+        ]
+
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("summary down")):
+            result = c.compress(msgs)
+
+        assert c._last_compress_aborted is True
+        assert c._last_summary_fallback_used is False
+        assert c._last_summary_dropped_count == 0
+        assert result == msgs
+        assert result[3]["content"] == long_tool_output
 
     def test_compress_clears_abort_flag_on_subsequent_success(self):
         mock_response = MagicMock()
@@ -1630,6 +1697,7 @@ class TestSummaryTargetRatio:
                 quiet_mode=True,
                 protect_first_n=0,
                 protect_last_n=2,
+                abort_on_summary_failure=False,
             )
         msgs = (
             [{"role": "system", "content": "System prompt"}]
