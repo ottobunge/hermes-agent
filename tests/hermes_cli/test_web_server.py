@@ -401,6 +401,31 @@ class TestWebServerEndpoints:
         assert row["is_default_profile"] is True
         assert isinstance(data.get("errors"), list)
 
+    def test_profiles_sessions_includes_mattermost_source(self):
+        """Desktop's cross-profile session list must include messaging sources.
+
+        Mattermost sessions live in the same SessionDB as TUI/CLI sessions and
+        must not be lost to source allow-lists when the desktop sidebar asks for
+        recent sessions with min_messages=1.
+        """
+        from hermes_state import SessionDB
+
+        db = SessionDB()
+        try:
+            db.create_session(session_id="mattermost-active", source="mattermost")
+            db.set_session_title("mattermost-active", "Mattermost Roadmap")
+            db.append_message(session_id="mattermost-active", role="user", content="mattermost update")
+        finally:
+            db.close()
+
+        resp = self.client.get("/api/profiles/sessions?limit=20&min_messages=1&order=recent")
+        assert resp.status_code == 200
+        data = resp.json()
+        row = next(s for s in data["sessions"] if s["id"] == "mattermost-active")
+        assert row["source"] == "mattermost"
+        assert row["profile"] == "default"
+        assert row["is_default_profile"] is True
+
     def test_profiles_sessions_rejects_unknown_archived_value(self):
         resp = self.client.get("/api/profiles/sessions?archived=bogus")
         assert resp.status_code == 400
