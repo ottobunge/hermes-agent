@@ -8,6 +8,7 @@ import type { SessionInfo } from '@/hermes'
 import { type Translations, useI18n } from '@/i18n'
 import { sessionTitle } from '@/lib/chat-runtime'
 import { triggerHaptic } from '@/lib/haptics'
+import { sessionSourceLabel } from '@/lib/session-source'
 import { cn } from '@/lib/utils'
 import { $attentionSessionIds } from '@/store/session'
 
@@ -67,6 +68,7 @@ export function SidebarSessionRow({
   const title = sessionTitle(session)
   const age = formatAge(session.last_active || session.started_at, r)
   const handleLabel = `Reorder ${title}`
+  const sourceLabel = sessionSourceLabel(session.source)
   // Subscribe per-row (the leaf) instead of drilling a set through the list —
   // the atom is tiny and rarely non-empty. True when a clarify prompt in this
   // session is waiting on the user.
@@ -182,6 +184,11 @@ export function SidebarSessionRow({
           <span className="min-w-0 flex-1 truncate text-[0.8125rem] font-normal text-(--ui-text-secondary) group-hover:text-foreground group-data-[working=true]:text-foreground/90">
             {title}
           </span>
+          {sourceLabel && (
+            <span className="max-w-20 shrink-0 truncate rounded-[3px] border border-(--ui-border) px-1 py-px text-[0.5625rem] font-medium uppercase tracking-wide text-(--ui-text-tertiary)">
+              {sourceLabel}
+            </span>
+          )}
         </button>
         <div className="relative z-2 grid w-[1.375rem] place-items-center">
           {!isWorking && (
