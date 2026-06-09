@@ -13,6 +13,7 @@ import { useSkinCommand } from '@/themes/use-skin-command'
 import { formatRefValue } from '../components/assistant-ui/directive-text'
 import { getSessionMessages, listAllProfileSessions, type SessionInfo } from '../hermes'
 import { preserveLocalAssistantErrors, toChatMessages } from '../lib/chat-messages'
+import { applyPendingSessionPrompt } from '../lib/live-session-prompts'
 import { toggleCommandPalette } from '../store/command-palette'
 import {
   $panesFlipped,
@@ -464,7 +465,7 @@ export function DesktopController() {
         ensureSessionState(live.id, storedSessionId)
 
         const busy = liveSessionBusy(live)
-        const needsInput = live.status === 'waiting'
+        const needsInput = live.status === 'waiting' || applyPendingSessionPrompt(live.id, live.pending_prompt)
 
         if (busy) {
           liveBusyIds.add(live.id)

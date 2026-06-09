@@ -6,6 +6,7 @@ import { deleteSession, getSessionMessages, setSessionArchived } from '@/hermes'
 import { type ChatMessage, chatMessageText, preserveLocalAssistantErrors, toChatMessages } from '@/lib/chat-messages'
 import { normalizePersonalityValue } from '@/lib/chat-runtime'
 import { embeddedImageUrls, textWithoutEmbeddedImages } from '@/lib/embedded-images'
+import { applyPendingSessionPrompt } from '@/lib/live-session-prompts'
 import { setSessionYolo } from '@/lib/yolo-session'
 import { clearComposerAttachments, clearComposerDraft } from '@/store/composer'
 import { clearQueuedPrompts } from '@/store/composer-queue'
@@ -581,7 +582,7 @@ export function useSessionActions({
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
         const resumedBusy = liveSessionBusy(resumed.status, resumed.running)
-        const resumedNeedsInput = resumed.status === 'waiting'
+        const resumedNeedsInput = resumed.status === 'waiting' || applyPendingSessionPrompt(resumed.session_id, resumed.pending_prompt)
 
         updateSessionState(
           resumed.session_id,
