@@ -3329,6 +3329,15 @@ def _session_pending_kind(sid: str) -> str:
     return ""
 
 
+def _session_pending_prompt(sid: str) -> dict | None:
+    for rid, (owner_sid, _ev) in list(_pending.items()):
+        if owner_sid != sid:
+            continue
+        event, payload = _pending_prompt_payloads.get(rid, ("input.request", {}))
+        return {"event": str(event), "payload": dict(payload)}
+    return None
+
+
 def _session_live_status(sid: str, session: dict) -> str:
     if _session_pending_kind(sid):
         return "waiting"
@@ -3370,7 +3379,7 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         preview = inflight.get("assistant") or inflight.get("user") or preview
         preview = " ".join(str(preview).split())[:160]
     now = time.time()
-    return {
+    row = {
         "current": sid == current_sid,
         "id": sid,
         "last_active": float(session.get("last_active") or session.get("created_at") or now),
@@ -3382,6 +3391,10 @@ def _session_live_item(sid: str, session: dict, current_sid: str = "") -> dict:
         "status": status,
         "title": _session_live_title(session, key),
     }
+    pending_prompt = _session_pending_prompt(sid)
+    if pending_prompt:
+        row["pending_prompt"] = pending_prompt
+    return row
 
 
 def _find_live_session_by_key(session_key: str) -> tuple[str, dict] | None:
@@ -3438,6 +3451,9 @@ def _live_session_payload(
     }
     if inflight:
         payload["inflight"] = inflight
+    pending_prompt = _session_pending_prompt(sid)
+    if pending_prompt:
+        payload["pending_prompt"] = pending_prompt
     return payload
 
 

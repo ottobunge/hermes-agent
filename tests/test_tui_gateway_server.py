@@ -4277,7 +4277,11 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
             return {"key-a": "Research", "key-b": "Implement"}.get(key, "")
 
     previous_sessions = dict(server._sessions)
+    previous_pending = dict(server._pending)
+    previous_prompt_payloads = dict(server._pending_prompt_payloads)
     server._sessions.clear()
+    server._pending.clear()
+    server._pending_prompt_payloads.clear()
     monkeypatch.setattr(server, "_get_db", lambda: _DB())
     server._sessions["sid-a"] = _session(
         agent=types.SimpleNamespace(model="model-a"),
@@ -4294,6 +4298,11 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
         created_at=11.0,
         last_active=30.0,
     )
+    server._pending["clarify-1"] = ("sid-b", threading.Event())
+    server._pending_prompt_payloads["clarify-1"] = (
+        "clarify.request",
+        {"choices": ["Fix first", "Include in stream"], "question": "How proceed?", "request_id": "clarify-1"},
+    )
     try:
         resp = server.handle_request(
             {
@@ -4305,6 +4314,10 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
     finally:
         server._sessions.clear()
         server._sessions.update(previous_sessions)
+        server._pending.clear()
+        server._pending.update(previous_pending)
+        server._pending_prompt_payloads.clear()
+        server._pending_prompt_payloads.update(previous_prompt_payloads)
 
     session_rows = resp["result"]["sessions"]
     assert [row["id"] for row in session_rows] == ["sid-a", "sid-b"]
@@ -4323,9 +4336,17 @@ def test_session_active_list_reports_live_sessions(monkeypatch):
         "title": "Research",
     }
     assert rows["sid-b"]["current"] is True
-    assert rows["sid-b"]["status"] == "working"
+    assert rows["sid-b"]["status"] == "waiting"
     assert rows["sid-b"]["title"] == "Implement"
     assert rows["sid-b"]["preview"] == "writing code"
+    assert rows["sid-b"]["pending_prompt"] == {
+        "event": "clarify.request",
+        "payload": {
+            "choices": ["Fix first", "Include in stream"],
+            "question": "How proceed?",
+            "request_id": "clarify-1",
+        },
+    }
 
 
 def test_session_activate_returns_inflight_stream_before_completion(monkeypatch):
