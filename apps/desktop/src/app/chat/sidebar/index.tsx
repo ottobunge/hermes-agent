@@ -70,8 +70,7 @@ import {
   $sessionsLoading,
   $sessionsTotal,
   $workingSessionIds,
-  sessionPinId,
-  sortSessionsByLatestActivity
+  sessionPinId
 } from '@/store/session'
 
 import { type AppView, ARTIFACTS_ROUTE, MESSAGING_ROUTE, SKILLS_ROUTE } from '../../routes'
@@ -116,6 +115,8 @@ const WS_ID_PREFIX = 'workspace:'
 const wsId = (id: string) => `${WS_ID_PREFIX}${id}`
 const parseWsId = (id: string) => (id.startsWith(WS_ID_PREFIX) ? id.slice(WS_ID_PREFIX.length) : null)
 const countLabel = (loaded: number, total: number) => (total > loaded ? `${loaded}/${total}` : String(loaded))
+const sessionTime = (s: SessionInfo) => s.last_active || s.started_at || 0
+
 function orderByIds<T>(items: T[], getId: (item: T) => string, orderIds: string[]): T[] {
   if (!orderIds.length) {
     return items
@@ -300,7 +301,7 @@ export function ChatSidebar({
   )
 
   const sortedSessions = useMemo(
-    () => sortSessionsByLatestActivity(visibleSessions),
+    () => [...visibleSessions].sort((a, b) => sessionTime(b) - sessionTime(a)),
     [visibleSessions]
   )
 
@@ -399,8 +400,8 @@ export function ChatSidebar({
   )
 
   const agentSessions = useMemo(
-    () => (agentsGrouped ? orderByIds(unpinnedAgentSessions, s => s.id, agentOrderIds) : unpinnedAgentSessions),
-    [unpinnedAgentSessions, agentOrderIds, agentsGrouped]
+    () => orderByIds(unpinnedAgentSessions, s => s.id, agentOrderIds),
+    [unpinnedAgentSessions, agentOrderIds]
   )
 
   const agentGroups = useMemo(
@@ -741,7 +742,7 @@ export function ChatSidebar({
             pinned={false}
             rootClassName="min-h-0 flex-1 p-0"
             sessions={agentSessions}
-            sortable={!showAllProfiles && agentsGrouped && agentSessions.length > 1}
+            sortable={!showAllProfiles && agentSessions.length > 1}
             workingSessionIdSet={workingSessionIdSet}
           />
         )}

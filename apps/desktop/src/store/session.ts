@@ -27,13 +27,6 @@ function updateAtom<T>(store: AppAtom<T>, next: Updater<T>) {
 export const sessionPinId = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string =>
   session._lineage_root_id ?? session.id
 
-export const sessionActivityTime = (session: Pick<SessionInfo, 'last_active' | 'started_at'>): number =>
-  session.last_active || session.started_at || 0
-
-export function sortSessionsByLatestActivity<T extends Pick<SessionInfo, 'last_active' | 'started_at'>>(sessions: T[]): T[] {
-  return [...sessions].sort((a, b) => sessionActivityTime(b) - sessionActivityTime(a))
-}
-
 /** Merge a fresh server session page into the in-memory list, keeping any
  *  row the server omitted that we still want visible — both still-"working"
  *  sessions and pinned sessions.
