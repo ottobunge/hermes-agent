@@ -316,10 +316,32 @@ export interface SessionMessagesResponse {
 
 export interface SessionResumeResponse {
   info?: SessionRuntimeInfo
+  inflight?: unknown
   message_count: number
   messages: SessionMessage[]
   resumed: string
+  running?: boolean
   session_id: string
+  session_key?: string
+  status?: 'idle' | 'starting' | 'waiting' | 'working' | string
+}
+
+export interface LiveSessionInfo {
+  current?: boolean
+  id: string
+  last_active?: number
+  message_count?: number
+  model?: string
+  preview?: string
+  running?: boolean
+  session_key?: string
+  started_at?: number
+  status?: 'idle' | 'starting' | 'waiting' | 'working' | string
+  title?: string
+}
+
+export interface ActiveSessionsResponse {
+  sessions: LiveSessionInfo[]
 }
 
 export interface SessionRuntimeInfo {

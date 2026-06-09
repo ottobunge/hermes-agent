@@ -269,6 +269,9 @@ function applyRuntimeInfo(
   return sessionState
 }
 
+const liveSessionBusy = (status: unknown, running?: boolean): boolean =>
+  Boolean(running) || status === 'working' || status === 'starting' || status === 'waiting'
+
 export function useSessionActions({
   activeSessionId,
   activeSessionIdRef,
@@ -577,14 +580,18 @@ export function useSessionActions({
 
         patchSessionWorkspace(storedSessionId, runtimeInfo?.cwd)
 
+        const resumedBusy = liveSessionBusy(resumed.status, resumed.running)
+        const resumedNeedsInput = resumed.status === 'waiting'
+
         updateSessionState(
           resumed.session_id,
           state => ({
             ...state,
             ...(runtimeInfo ?? {}),
             messages: messagesForView,
-            busy: false,
-            awaitingResponse: false
+            busy: resumedBusy,
+            awaitingResponse: resumedBusy,
+            needsInput: resumedNeedsInput
           }),
           storedSessionId
         )
@@ -605,9 +612,11 @@ export function useSessionActions({
         notifyError(err, 'Resume failed')
       } finally {
         if (isCurrentResume()) {
-          busyRef.current = false
-          setBusy(false)
-          setAwaitingResponse(false)
+          const current = sessionStateByRuntimeIdRef.current.get(activeSessionIdRef.current ?? '')
+          const busy = Boolean(current?.busy)
+          busyRef.current = busy
+          setBusy(busy)
+          setAwaitingResponse(Boolean(current?.awaitingResponse))
         }
       }
     },

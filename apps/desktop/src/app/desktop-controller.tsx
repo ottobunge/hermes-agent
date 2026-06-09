@@ -32,6 +32,7 @@ import { $filePreviewTarget, $previewTarget, closeActiveRightRailTab } from '../
 import { $activeGatewayProfile, $freshSessionRequest, normalizeProfileKey, refreshActiveProfile } from '../store/profile'
 import {
   $activeSessionId,
+  $attentionSessionIds,
   $currentCwd,
   $freshDraftReady,
   $gatewayState,
@@ -50,9 +51,13 @@ import {
   setSessionProfileTotals,
   setSessions,
   setSessionsLoading,
-  setSessionsTotal
+  setSessionsTotal,
+  setSessionAttention,
+  setSessionWorking
 } from '../store/session'
 import { openUpdatesWindow, startUpdatePoller, stopUpdatePoller } from '../store/updates'
+
+import type { ActiveSessionsResponse, LiveSessionInfo } from '../types/hermes'
 
 import { ChatView } from './chat'
 import { useComposerActions } from './chat/hooks/use-composer-actions'
@@ -99,7 +104,17 @@ const CronView = lazy(async () => ({ default: (await import('./cron')).CronView 
 const MessagingView = lazy(async () => ({ default: (await import('./messaging')).MessagingView }))
 const ProfilesView = lazy(async () => ({ default: (await import('./profiles')).ProfilesView }))
 const SettingsView = lazy(async () => ({ default: (await import('./settings')).SettingsView }))
+
 const SkillsView = lazy(async () => ({ default: (await import('./skills')).SkillsView }))
+
+const liveSessionBusy = (session: Pick<LiveSessionInfo, 'running' | 'status'> | null | undefined): boolean =>
+  Boolean(session?.running) ||
+  session?.status === 'working' ||
+  session?.status === 'starting' ||
+  session?.status === 'waiting'
+
+const sessionRowAliases = (session: Pick<SessionInfo, '_lineage_root_id' | 'id'>): string[] =>
+  session._lineage_root_id ? [session.id, session._lineage_root_id] : [session.id]
 
 // Rows a session refresh must preserve even if the aggregator omits them:
 // in-flight first turns (message_count 0), pinned rows aged off the page, and
@@ -430,6 +445,86 @@ export function DesktopController() {
     routedSessionId,
     selectedStoredSessionId
   })
+
+  const reconcileLiveSessions = useCallback(async () => {
+    if (gatewayState !== 'open') {
+      return
+    }
+
+    try {
+      const result = await requestGateway<ActiveSessionsResponse>('session.active_list', {
+        current_session_id: activeSessionIdRef.current ?? ''
+      })
+      const activeProfile = normalizeProfileKey($activeGatewayProfile.get())
+      const liveBusyIds = new Set<string>()
+      const liveAttentionIds = new Set<string>()
+
+      for (const live of result.sessions ?? []) {
+        const storedSessionId = live.session_key || live.id
+        ensureSessionState(live.id, storedSessionId)
+
+        const busy = liveSessionBusy(live)
+        const needsInput = live.status === 'waiting'
+
+        if (busy) {
+          liveBusyIds.add(live.id)
+          liveBusyIds.add(storedSessionId)
+        }
+
+        if (needsInput) {
+          liveAttentionIds.add(live.id)
+          liveAttentionIds.add(storedSessionId)
+        }
+
+        setSessionWorking(storedSessionId, busy)
+        setSessionAttention(storedSessionId, needsInput)
+
+        if (live.id === activeSessionIdRef.current) {
+          updateSessionState(
+            live.id,
+            state => ({
+              ...state,
+              busy,
+              awaitingResponse: busy,
+              needsInput
+            }),
+            storedSessionId
+          )
+        }
+      }
+
+      const decoratedIds = new Set([...$workingSessionIds.get(), ...$attentionSessionIds.get()])
+
+      for (const id of decoratedIds) {
+        const row = $sessions.get().find(session => sessionRowAliases(session).includes(id))
+
+        if (!row || normalizeProfileKey(row.profile) !== activeProfile) {
+          continue
+        }
+
+        const aliases = sessionRowAliases(row)
+
+        if (!aliases.some(alias => liveBusyIds.has(alias))) {
+          setSessionWorking(id, false)
+        }
+
+        if (!aliases.some(alias => liveAttentionIds.has(alias))) {
+          setSessionAttention(id, false)
+        }
+      }
+    } catch {
+      // Best effort: a reconnect may still be handshaking. Streaming events or a
+      // later open transition will refresh the same state.
+    }
+  }, [activeSessionIdRef, ensureSessionState, gatewayState, requestGateway, updateSessionState])
+
+  useEffect(() => {
+    if (gatewayState !== 'open') {
+      return
+    }
+
+    void reconcileLiveSessions()
+  }, [gatewayState, reconcileLiveSessions])
 
   const {
     archiveSession,
