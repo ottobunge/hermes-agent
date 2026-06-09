@@ -2,7 +2,14 @@ import { describe, expect, it } from 'vitest'
 
 import type { SessionInfo } from '@/types/hermes'
 
-import { $attentionSessionIds, mergeSessionPage, sessionPinId, setSessionAttention } from './session'
+import {
+  $attentionSessionIds,
+  mergeSessionPage,
+  sessionActivityTime,
+  sessionPinId,
+  setSessionAttention,
+  sortSessionsByLatestActivity
+} from './session'
 
 const session = (over: Partial<SessionInfo>): SessionInfo => ({
   archived: false,
@@ -60,6 +67,23 @@ describe('sessionPinId', () => {
     // After auto-compression the entry surfaces under a fresh tip id but keeps
     // the original root — pinning on the root keeps the pin stable.
     expect(sessionPinId(session({ id: 'tip', _lineage_root_id: 'root' }))).toBe('root')
+  })
+})
+
+describe('session activity ordering', () => {
+  it('uses last activity with started_at as a fallback', () => {
+    expect(sessionActivityTime(session({ id: 'active', last_active: 20, started_at: 10 }))).toBe(20)
+    expect(sessionActivityTime(session({ id: 'new', last_active: 0, started_at: 10 }))).toBe(10)
+  })
+
+  it('sorts sessions by latest activity descending without mutating input', () => {
+    const older = session({ id: 'older', last_active: 10, started_at: 100 })
+    const fallback = session({ id: 'fallback', last_active: 0, started_at: 30 })
+    const latest = session({ id: 'latest', last_active: 50, started_at: 1 })
+    const input = [older, fallback, latest]
+
+    expect(sortSessionsByLatestActivity(input).map(s => s.id)).toEqual(['latest', 'fallback', 'older'])
+    expect(input.map(s => s.id)).toEqual(['older', 'fallback', 'latest'])
   })
 })
 
