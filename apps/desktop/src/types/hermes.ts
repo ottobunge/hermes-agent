@@ -319,6 +319,7 @@ export interface SessionResumeResponse {
   inflight?: unknown
   message_count: number
   messages: SessionMessage[]
+  pending_prompt?: PendingSessionPrompt
   resumed: string
   running?: boolean
   session_id: string
@@ -332,6 +333,7 @@ export interface LiveSessionInfo {
   last_active?: number
   message_count?: number
   model?: string
+  pending_prompt?: PendingSessionPrompt
   preview?: string
   running?: boolean
   session_key?: string
@@ -342,6 +344,11 @@ export interface LiveSessionInfo {
 
 export interface ActiveSessionsResponse {
   sessions: LiveSessionInfo[]
+}
+
+export interface PendingSessionPrompt {
+  event?: string
+  payload?: Record<string, unknown>
 }
 
 export interface SessionRuntimeInfo {
