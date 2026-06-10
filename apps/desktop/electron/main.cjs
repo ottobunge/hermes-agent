@@ -3938,13 +3938,26 @@ async function fetchJsonForProfile(profile, path) {
 }
 
 // Issue an arbitrary method against a profile's resolved backend, parsed JSON.
-async function requestJsonForProfile(profile, path, method, body) {
+async function requestJsonForProfile(profile, path, method, body, timeoutMsOverride) {
   const conn = await ensureBackend(profile)
-  const url = `${conn.baseUrl}${path}`
-  const opts = { method, body, timeoutMs: DEFAULT_FETCH_TIMEOUT_MS }
-  return conn.authMode === 'oauth'
-    ? fetchJsonViaOauthSession(url, opts)
-    : fetchJson(url, conn.token, opts)
+  const requestMethod = method || 'GET'
+  const opts = { method: requestMethod, body, timeoutMs: resolveTimeoutMs(timeoutMsOverride, DEFAULT_FETCH_TIMEOUT_MS) }
+  const request = connection =>
+    connection.authMode === 'oauth'
+      ? fetchJsonViaOauthSession(`${connection.baseUrl}${path}`, opts)
+      : fetchJson(`${connection.baseUrl}${path}`, connection.token, opts)
+
+  try {
+    return await request(conn)
+  } catch (error) {
+    if (requestMethod !== 'GET' || conn.mode !== 'local' || !backendRequestLooksRecoverable(error)) {
+      throw error
+    }
+
+    await restartLocalBackendForProfile(profile)
+    const recovered = await ensureBackend(profile)
+    return request(recovered)
+  }
 }
 
 async function probeRemoteAuthMode(rawUrl) {
@@ -4092,6 +4105,19 @@ function resetHermesConnection() {
   resetBootProgressForReconnect()
 }
 
+function backendRequestLooksRecoverable(error) {
+  const message = error instanceof Error ? error.message : String(error || '')
+  const code = error && typeof error === 'object' ? error.code : ''
+
+  return (
+    /Timed out connecting to Hermes backend/i.test(message) ||
+    code === 'ECONNREFUSED' ||
+    code === 'ECONNRESET' ||
+    code === 'EPIPE' ||
+    code === 'ETIMEDOUT'
+  )
+}
+
 // Re-home the primary backend: reset connection state, then wait for the live
 // dashboard process to actually exit (SIGKILL after 5s) so the next
 // startHermes() spawns fresh instead of racing the dying one. Shared by the
@@ -4119,6 +4145,19 @@ async function teardownPrimaryBackendAndWait() {
       resolve()
     })
   })
+}
+
+async function restartLocalBackendForProfile(profile) {
+  const key = profile && String(profile).trim() ? String(profile).trim() : primaryProfileKey()
+
+  if (key === primaryProfileKey()) {
+    rememberLog('Restarting primary Hermes backend after connection failure')
+    await teardownPrimaryBackendAndWait()
+    return
+  }
+
+  rememberLog(`Restarting Hermes backend for profile "${key}" after connection failure`)
+  stopPoolBackend(key)
 }
 
 // The profile the primary (window) backend runs as. readActiveDesktopProfile()
@@ -4875,25 +4914,8 @@ ipcMain.handle('hermes:api', async (_event, request) => {
     return rerouted
   }
 
-  const connection = await ensureBackend(request?.profile)
   const timeoutMs = resolveTimeoutMs(request?.timeoutMs, DEFAULT_FETCH_TIMEOUT_MS)
-  const url = `${connection.baseUrl}${request.path}`
-  // OAuth gateways authenticate REST via the HttpOnly session cookie held in
-  // the OAuth partition — route through Electron's net stack bound to that
-  // session so the cookie attaches automatically. Token/local modes keep using
-  // the static session-token header.
-  if (connection.authMode === 'oauth') {
-    return fetchJsonViaOauthSession(url, {
-      method: request?.method,
-      body: request?.body,
-      timeoutMs
-    })
-  }
-  return fetchJson(url, connection.token, {
-    method: request?.method,
-    body: request?.body,
-    timeoutMs
-  })
+  return requestJsonForProfile(request?.profile, request.path, request?.method, request?.body, timeoutMs)
 })
 
 ipcMain.handle('hermes:notify', (_event, payload) => {
