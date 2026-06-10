@@ -223,6 +223,61 @@ def test_session_db_caches_profile_db_and_teardown_closes(monkeypatch, tmp_path)
     assert first.closed is True
 
 
+def test_start_agent_build_caches_agent_profile_db(monkeypatch, tmp_path):
+    class FakeDB:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    class ImmediateThread:
+        def __init__(self, target=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    opened = []
+    captured = {}
+
+    def fake_open(profile_home):
+        db = FakeDB()
+        opened.append((profile_home, db))
+        return db
+
+    def fake_make_agent(_sid, _key, session_db=None):
+        captured["session_db"] = session_db
+        return types.SimpleNamespace(model="test")
+
+    session = _session(
+        agent=None,
+        agent_ready=threading.Event(),
+        profile_home=str(tmp_path / "profile"),
+        session_key="profile-key",
+    )
+    server._sessions["sid"] = session
+    monkeypatch.setattr(server.threading, "Thread", ImmediateThread)
+    monkeypatch.setattr(server, "_open_profile_db", fake_open)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_set_session_context", lambda _key: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_SlashWorker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    try:
+        server._start_agent_build("sid", session)
+        assert captured["session_db"] is opened[0][1]
+        assert session["session_db"] is opened[0][1]
+        server._teardown_session(session)
+        assert opened[0][1].closed is True
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_finalize_session_uses_session_db(monkeypatch):
     calls = {}
 
@@ -1024,7 +1079,7 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
     monkeypatch.setattr(
         server,
         "_init_session",
-        lambda sid, key, agent, history, cols=80, profile_home=None: None,
+        lambda sid, key, agent, history, cols=80, profile_home=None, session_db=None: None,
     )
 
     resp = server.handle_request(
@@ -1036,6 +1091,68 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         {"role": "assistant", "text": "root answer"},
     ]
     assert captured["history_calls"] == [("tip", False), ("tip", True)]
+
+
+def test_session_resume_caches_agent_profile_db(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeDB:
+        def __init__(self):
+            self.closed = False
+
+        def get_session(self, target):
+            return {"id": target}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, target):
+            captured["reopened"] = target
+
+        def get_messages_as_conversation(self, target, include_ancestors=False):
+            return [{"role": "user", "content": f"history {target}"}]
+
+        def update_session_cwd(self, session_id, cwd):
+            captured["cwd"] = (session_id, cwd)
+
+        def close(self):
+            self.closed = True
+
+    profile_db = FakeDB()
+    profile_home = tmp_path / "profiles" / "work"
+
+    def fake_make_agent(_sid, _key, session_id=None, session_db=None):
+        captured["session_db"] = session_db
+        return types.SimpleNamespace(model="test", session_id=session_id, close=lambda: None)
+
+    monkeypatch.setattr(server, "_db_for_request_profile", lambda _params: (profile_db, profile_home))
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_session_info", lambda _agent, _session: {"model": "test"})
+    monkeypatch.setattr(server, "_SlashWorker", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_wire_callbacks", lambda _sid: None)
+    monkeypatch.setattr(server, "_start_notification_poller", lambda *_args: None)
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(server, "_emit", lambda *_args, **_kwargs: None)
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.resume",
+            "params": {"session_id": "stored", "profile": "work"},
+        }
+    )
+    sid = resp["result"]["session_id"]
+
+    try:
+        assert captured["session_db"] is profile_db
+        assert server._sessions[sid]["session_db"] is profile_db
+        server._teardown_session(server._sessions[sid])
+        assert profile_db.closed is True
+    finally:
+        server._sessions.pop(sid, None)
 
 
 def test_status_callback_emits_kind_and_text():

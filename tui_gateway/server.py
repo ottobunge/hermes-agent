@@ -793,7 +793,7 @@ def _start_agent_build(sid: str, session: dict) -> None:
             session_db = None
             if profile_home:
                 home_token = set_hermes_home_override(profile_home)
-                session_db = _open_profile_db(profile_home)
+                session_db = current.get("session_db") or _open_profile_db(profile_home)
             try:
                 agent = _make_agent(sid, key, session_db=session_db)
                 stored_usage = current.get("stored_usage")
@@ -805,6 +805,8 @@ def _start_agent_build(sid: str, session: dict) -> None:
             # Session DB row deferred to first run_conversation() call.
             # pending_title applied post-first-message (see cli.exec handler).
             current["agent"] = agent
+            if profile_home and session_db is not None:
+                current["session_db"] = session_db
 
             try:
                 worker = _SlashWorker(key, getattr(agent, "model", _resolve_model()))
@@ -852,6 +854,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
                         worker.close()
                     except Exception:
                         pass
+                try:
+                    db = current.pop("session_db", None)
+                    if db is not None and hasattr(db, "close"):
+                        db.close()
+                except Exception:
+                    pass
                 if notify_registered:
                     try:
                         from tools.approval import unregister_gateway_notify
@@ -936,6 +944,7 @@ def _recover_session_from_db(sid: str, params: dict) -> dict | None:
             "profile_home": str(profile_home) if profile_home is not None else None,
             "running": False,
             "session_key": key,
+            "session_db": db if profile_home is not None else None,
             "show_reasoning": _load_show_reasoning(),
             "slash_worker": None,
             "stored_usage": dict(found),
@@ -2814,6 +2823,7 @@ def _init_session(
     history: list,
     cols: int = 80,
     profile_home: str | Path | None = None,
+    session_db=None,
 ):
     now = time.time()
     with _sessions_lock:
@@ -2828,6 +2838,7 @@ def _init_session(
             "last_active": now,
             "running": False,
             "profile_home": str(profile_home) if profile_home is not None else None,
+            "session_db": session_db,
             "attached_images": [],
             "image_counter": 0,
             "cwd": _completion_cwd(),
@@ -3501,7 +3512,15 @@ def _(rid, params: dict) -> dict:
             payload["resumed"] = target
             return _ok(rid, payload)
         try:
-            _init_session(sid, target, agent, history, cols=cols, profile_home=profile_home)
+            _init_session(
+                sid,
+                target,
+                agent,
+                history,
+                cols=cols,
+                profile_home=profile_home,
+                session_db=db if profile_home is not None else None,
+            )
             _register_runtime_session(db, sid, target)
             if sid in _sessions:
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
