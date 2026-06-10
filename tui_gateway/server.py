@@ -1660,26 +1660,55 @@ def _get_usage(agent) -> dict:
             usage["context_max"] = ctx_max
             usage["context_percent"] = max(0, min(100, round(ctx_used / ctx_max * 100)))
         usage["compressions"] = getattr(comp, "compression_count", 0) or 0
+    restored_cost = float(getattr(agent, "session_estimated_cost_usd", 0.0) or 0.0)
+    restored_status = getattr(agent, "session_cost_status", "unknown") or "unknown"
+    if restored_cost or restored_status != "unknown":
+        usage["cost_usd"] = restored_cost
+        usage["cost_status"] = restored_status
     try:
         from agent.usage_pricing import CanonicalUsage, estimate_usage_cost
 
-        cost = estimate_usage_cost(
-            usage["model"],
-            CanonicalUsage(
-                input_tokens=usage["input"],
-                output_tokens=usage["output"],
-                cache_read_tokens=usage["cache_read"],
-                cache_write_tokens=usage["cache_write"],
-            ),
-            provider=getattr(agent, "provider", None),
-            base_url=getattr(agent, "base_url", None),
-        )
-        usage["cost_status"] = cost.status
-        if cost.amount_usd is not None:
-            usage["cost_usd"] = float(cost.amount_usd)
+        if "cost_usd" not in usage:
+            cost = estimate_usage_cost(
+                usage["model"],
+                CanonicalUsage(
+                    input_tokens=usage["input"],
+                    output_tokens=usage["output"],
+                    cache_read_tokens=usage["cache_read"],
+                    cache_write_tokens=usage["cache_write"],
+                ),
+                provider=getattr(agent, "provider", None),
+                base_url=getattr(agent, "base_url", None),
+            )
+            usage["cost_status"] = cost.status
+            if cost.amount_usd is not None:
+                usage["cost_usd"] = float(cost.amount_usd)
     except Exception:
         pass
     return usage
+
+
+def _restore_session_usage(agent, stored: dict) -> None:
+    """Restore cumulative token counters from a stored session row."""
+    agent.session_input_tokens = stored.get("input_tokens") or 0
+    agent.session_output_tokens = stored.get("output_tokens") or 0
+    agent.session_cache_read_tokens = stored.get("cache_read_tokens") or 0
+    agent.session_cache_write_tokens = stored.get("cache_write_tokens") or 0
+    agent.session_reasoning_tokens = stored.get("reasoning_tokens") or 0
+    agent.session_total_tokens = (
+        agent.session_input_tokens
+        + agent.session_output_tokens
+        + agent.session_cache_read_tokens
+        + agent.session_cache_write_tokens
+        + agent.session_reasoning_tokens
+    )
+    agent.session_api_calls = stored.get("api_call_count") or 0
+    cost_usd = stored.get("estimated_cost_usd")
+    if cost_usd:
+        agent.session_estimated_cost_usd = float(cost_usd)
+    cost_status = stored.get("cost_status")
+    if cost_status:
+        agent.session_cost_status = cost_status
 
 
 def _probe_credentials(agent) -> str:
@@ -3238,6 +3267,8 @@ def _(rid, params: dict) -> dict:
             # state.db; home override is active here so config/skills/model
             # resolve to the profile too.
             agent = _make_agent(sid, target, session_id=target, session_db=db)
+            if found:
+                _restore_session_usage(agent, found)
         finally:
             _clear_session_context(tokens)
     except Exception as e:
