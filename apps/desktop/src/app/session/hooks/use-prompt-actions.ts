@@ -137,6 +137,12 @@ function visibleUserOrdinal(messages: readonly ChatMessage[], end: number): numb
   return messages.slice(0, end).filter(m => m.role === 'user' && !m.hidden).length
 }
 
+function isSessionNotFoundError(error: unknown): boolean {
+  const message = error instanceof Error ? error.message : String(error)
+
+  return /session not found/i.test(message)
+}
+
 export function usePromptActions({
   activeSessionId,
   activeSessionIdRef,
@@ -334,7 +340,32 @@ export function usePromptActions({
         await syncImageAttachmentsForSubmit(sessionId, attachments, {
           updateComposerAttachments: usingComposerAttachments
         })
-        await requestGateway('prompt.submit', { session_id: sessionId, text })
+
+        try {
+          await requestGateway('prompt.submit', { session_id: sessionId, text })
+        } catch (firstErr) {
+          if (!isSessionNotFoundError(firstErr) || !selectedStoredSessionIdRef.current) {
+            throw firstErr
+          }
+
+          // Sleep/wake can leave Desktop holding a runtime id from a gateway
+          // process whose in-memory session table was cleared. Resume the durable
+          // stored session, update the live id, and retry the submit once.
+          const resumed = await requestGateway<{ session_id: string }>('session.resume', {
+            session_id: selectedStoredSessionIdRef.current
+          })
+
+          const recoveredId = resumed?.session_id
+
+          if (!recoveredId) {
+            throw firstErr
+          }
+
+          activeSessionIdRef.current = recoveredId
+          sessionId = recoveredId
+          seedOptimistic(recoveredId)
+          await requestGateway('prompt.submit', { session_id: recoveredId, text })
+        }
 
         if (usingComposerAttachments) {
           clearComposerAttachments()
@@ -376,6 +407,7 @@ export function usePromptActions({
     },
     [
       activeSessionId,
+      activeSessionIdRef,
       busyRef,
       createBackendSessionForSend,
       requestGateway,
@@ -531,6 +563,7 @@ export function usePromptActions({
               session_id: sessionId,
               title: arg
             })
+
             const finalTitle = (result?.title || arg).trim()
             const queued = result?.pending === true
 

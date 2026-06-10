@@ -9,6 +9,8 @@ import type { SessionInfo } from '@/types/hermes'
 import { usePromptActions } from './use-prompt-actions'
 
 vi.mock('@/hermes', () => ({
+  getProfiles: vi.fn(async () => ({ profiles: [] })),
+  setApiRequestProfile: vi.fn(),
   transcribeAudio: vi.fn()
 }))
 
@@ -45,14 +47,20 @@ interface HarnessHandle {
 function Harness({
   onReady,
   refreshSessions,
-  requestGateway
+  requestGateway,
+  storedSessionId
 }: {
   onReady: (handle: HarnessHandle) => void
   refreshSessions: () => Promise<void>
   requestGateway: <T>(method: string, params?: Record<string, unknown>) => Promise<T>
+  storedSessionId?: null | string
 }) {
   const activeSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
-  const selectedStoredSessionIdRef: MutableRefObject<string | null> = { current: RUNTIME_SESSION_ID }
+
+  const selectedStoredSessionIdRef: MutableRefObject<string | null> = {
+    current: storedSessionId === undefined ? RUNTIME_SESSION_ID : storedSessionId
+  }
+
   const busyRef = { current: false }
 
   const actions = usePromptActions({
@@ -90,6 +98,7 @@ describe('usePromptActions /title', () => {
 
   it('renames via the session.title RPC (with the runtime id), updates the sidebar store, and refreshes', async () => {
     const refreshSessions = vi.fn(async () => undefined)
+
     const requestGateway = vi.fn(async (method: string) =>
       (method === 'session.title' ? { pending: false, title: 'New title' } : {}) as never
     )
@@ -113,6 +122,7 @@ describe('usePromptActions /title', () => {
 
   it('reports the queued state when the session row is not persisted yet', async () => {
     const refreshSessions = vi.fn(async () => undefined)
+
     const requestGateway = vi.fn(async (method: string) =>
       (method === 'session.title' ? { pending: true, title: 'Fresh chat' } : {}) as never
     )
@@ -146,6 +156,7 @@ describe('usePromptActions /title', () => {
 
   it('surfaces a rename error without touching the sidebar store', async () => {
     const refreshSessions = vi.fn(async () => undefined)
+
     const requestGateway = vi.fn(async (method: string) => {
       if (method === 'session.title') {
         throw new Error('Title too long')
@@ -162,5 +173,109 @@ describe('usePromptActions /title', () => {
     expect(requestGateway).toHaveBeenCalledWith('session.title', expect.objectContaining({ title: 'way too long title' }))
     expect(refreshSessions).not.toHaveBeenCalled()
     expect($sessions.get()[0]?.title).toBe('Old title')
+  })
+})
+
+describe('usePromptActions sleep/wake session recovery', () => {
+  const STORED_SESSION_ID = 'stored-db-xyz789'
+  const RECOVERED_SESSION_ID = 'rt-recovered-456'
+
+  afterEach(() => {
+    cleanup()
+    vi.restoreAllMocks()
+  })
+
+  it('resumes the stored session and retries once when prompt.submit reports session not found', async () => {
+    const calls: { method: string; params?: Record<string, unknown> }[] = []
+    let submitAttempts = 0
+
+    const requestGateway = vi.fn(async (method: string, params?: Record<string, unknown>) => {
+      calls.push({ method, params })
+
+      if (method === 'prompt.submit') {
+        submitAttempts += 1
+
+        if (submitAttempts === 1) {
+          throw new Error('session not found')
+        }
+
+        return {} as never
+      }
+
+      if (method === 'session.resume') {
+        return { session_id: RECOVERED_SESSION_ID } as never
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    expect(await handle!.submitText('message after wake')).toBe(true)
+    expect(calls.map(call => call.method)).toEqual(['prompt.submit', 'session.resume', 'prompt.submit'])
+    expect(calls[1]?.params).toEqual({ session_id: STORED_SESSION_ID })
+    expect(calls[2]?.params).toEqual({ session_id: RECOVERED_SESSION_ID, text: 'message after wake' })
+  })
+
+  it('does not resume when the submit failure is unrelated', async () => {
+    const calls: string[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'prompt.submit') {
+        throw new Error('session busy')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={STORED_SESSION_ID}
+      />
+    )
+
+    expect(await handle!.submitText('message')).toBe(false)
+    expect(calls).toEqual(['prompt.submit'])
+  })
+
+  it('does not resume session not found errors without a stored session id', async () => {
+    const calls: string[] = []
+
+    const requestGateway = vi.fn(async (method: string) => {
+      calls.push(method)
+
+      if (method === 'prompt.submit') {
+        throw new Error('session not found')
+      }
+
+      return {} as never
+    })
+
+    let handle: HarnessHandle | null = null
+    render(
+      <Harness
+        onReady={h => (handle = h)}
+        refreshSessions={async () => undefined}
+        requestGateway={requestGateway}
+        storedSessionId={null}
+      />
+    )
+
+    expect(await handle!.submitText('message')).toBe(false)
+    expect(calls).toEqual(['prompt.submit'])
   })
 })

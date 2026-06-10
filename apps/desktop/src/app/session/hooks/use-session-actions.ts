@@ -338,11 +338,13 @@ export function useSessionActions({
         // Pass the owning profile so a new chat under a non-launch profile (global
         // remote mode) builds its agent + persists against THAT profile's home/db.
         const newChatProfile = $newChatProfile.get()
+
         const created = await requestGateway<SessionCreateResponse>('session.create', {
           cols: 96,
           ...(cwd && { cwd }),
           ...(newChatProfile ? { profile: newChatProfile } : {})
         })
+
         const stored = created.stored_session_id ?? null
 
         if (
@@ -494,8 +496,11 @@ export function useSessionActions({
       setFreshDraftReady(false)
       setActiveSessionId(null)
       activeSessionIdRef.current = null
-      busyRef.current = true
-      setBusy(true)
+      // Do not inherit the previous session's busy/streaming UI while the target
+      // session resumes. Running sessions are re-marked busy below once the
+      // gateway confirms their live state.
+      busyRef.current = false
+      setBusy(false)
       setAwaitingResponse(false)
       clearNotifications()
       setSelectedStoredSessionId(storedSessionId)
