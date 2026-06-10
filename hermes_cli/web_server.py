@@ -9360,6 +9360,16 @@ def start_server(
                 "(headless Linux). Pass --no-open to suppress this detection."
             )
 
+    try:
+        from hermes_cli.mcp_startup import start_background_mcp_discovery
+
+        start_background_mcp_discovery(
+            logger=logging.getLogger("hermes.dashboard"),
+            thread_name="dashboard-mcp-discovery",
+        )
+    except Exception:
+        pass
+
     print(f"  Hermes Web UI → http://{host}:{port}")
     # proxy_headers defaults to False so _ws_client_is_allowed sees the real
     # connection peer rather than X-Forwarded-For's rewritten value (which

@@ -202,10 +202,18 @@ def wait_for_mcp_discovery(timeout: float = 0.75) -> None:
     invisible for the whole session.  Joining with a short bounded timeout
     before the first agent build lets already-spawning fast servers land
     without re-introducing the startup hang: a dead server simply isn't waited
-    on beyond ``timeout``.  No-op when no discovery thread was started.
+    on beyond ``timeout``.  Dashboard/Desktop starts MCP discovery from
+    ``hermes_cli.mcp_startup`` instead of this entrypoint, so fall back to that
+    shared thread when the local one is unset.
     """
     thread = _mcp_discovery_thread
     if thread is None or not thread.is_alive():
+        try:
+            from hermes_cli.mcp_startup import wait_for_mcp_discovery as _mcp_wait
+
+            _mcp_wait(timeout=timeout)
+        except Exception:
+            pass
         return
     thread.join(timeout=timeout)
 
