@@ -351,8 +351,10 @@ export function usePromptActions({
           // Sleep/wake can leave Desktop holding a runtime id from a gateway
           // process whose in-memory session table was cleared. Resume the durable
           // stored session, update the live id, and retry the submit once.
+          const profileKey = normalizeProfileKey($activeGatewayProfile.get())
           const resumed = await requestGateway<{ session_id: string }>('session.resume', {
-            session_id: selectedStoredSessionIdRef.current
+            session_id: selectedStoredSessionIdRef.current,
+            ...(profileKey ? { profile: profileKey } : {})
           })
 
           const recoveredId = resumed?.session_id

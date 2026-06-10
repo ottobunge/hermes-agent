@@ -467,7 +467,10 @@ export function useSessionActions({
         clearComposerAttachments()
 
         try {
-          const usage = await requestGateway<UsageStats>('session.usage', { session_id: cachedRuntimeId })
+          const usage = await requestGateway<UsageStats>('session.usage', {
+            session_id: cachedRuntimeId,
+            ...(sessionProfile ? { profile: sessionProfile } : {})
+          })
 
           if (!isCurrentResume()) {
             return

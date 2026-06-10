@@ -1,5 +1,6 @@
 import json
 import os
+import sqlite3
 import sys
 import threading
 import time
@@ -58,6 +59,281 @@ def test_session_context_explicit_cwd_for_ephemeral_task(monkeypatch, tmp_path):
         assert resolve_agent_cwd() == project
     finally:
         server._clear_session_context(tokens)
+
+
+def test_runtime_session_mapping_round_trips():
+    db = types.SimpleNamespace(_conn=sqlite3.connect(":memory:"))
+    db._conn.row_factory = sqlite3.Row
+
+    server._register_runtime_session(db, "runtime-1", "stored-1")
+
+    assert server._resolve_stored_id(db, "runtime-1") == "stored-1"
+
+    server._clear_runtime_session(db, "runtime-1")
+
+    assert server._resolve_stored_id(db, "runtime-1") is None
+
+
+def test_sess_nowait_recovers_runtime_session_from_db(monkeypatch, tmp_path):
+    db = types.SimpleNamespace(_conn=sqlite3.connect(":memory:"))
+    db._conn.row_factory = sqlite3.Row
+    stored = {
+        "id": "stored-1",
+        "input_tokens": 3,
+        "output_tokens": 2,
+        "cache_read_tokens": 0,
+        "cache_write_tokens": 0,
+        "reasoning_tokens": 0,
+        "api_call_count": 1,
+        "estimated_cost_usd": 0.01,
+        "cost_status": "estimated",
+    }
+
+    def get_session(session_id):
+        return stored if session_id == "stored-1" else None
+
+    db.get_session = get_session
+    db.get_messages_as_conversation = lambda session_id: [
+        {"role": "user", "content": f"history for {session_id}"}
+    ]
+    server._register_runtime_session(db, "runtime-1", "stored-1")
+
+    class FakeTimer:
+        def __init__(self, _delay, _callback):
+            self.daemon = False
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+
+    session, err = server._sess_nowait(
+        {"session_id": "runtime-1", "cwd": str(tmp_path)}, "rid-1"
+    )
+
+    try:
+        assert err is None
+        assert session is server._sessions["runtime-1"]
+        assert session["session_key"] == "stored-1"
+        assert session["history"] == [
+            {"role": "user", "content": "history for stored-1"}
+        ]
+        assert session["stored_usage"]["estimated_cost_usd"] == 0.01
+        assert session["agent_ready"].is_set() is False
+    finally:
+        server._sessions.pop("runtime-1", None)
+
+
+def test_sess_nowait_recovers_runtime_session_from_profile_db(monkeypatch, tmp_path):
+    launch_db = types.SimpleNamespace(_conn=sqlite3.connect(":memory:"))
+    launch_db._conn.row_factory = sqlite3.Row
+    launch_db.get_session = lambda _session_id: None
+    launch_db.get_messages_as_conversation = lambda _session_id: []
+
+    profile_db = types.SimpleNamespace(_conn=sqlite3.connect(":memory:"))
+    profile_db._conn.row_factory = sqlite3.Row
+    stored = {"id": "profile-stored", "input_tokens": 4, "output_tokens": 5}
+    profile_db.get_session = lambda session_id: stored if session_id == "profile-stored" else None
+    profile_db.get_messages_as_conversation = lambda session_id: [
+        {"role": "user", "content": f"profile history for {session_id}"}
+    ]
+    server._register_runtime_session(profile_db, "profile-runtime", "profile-stored")
+
+    class FakeTimer:
+        def __init__(self, _delay, _callback):
+            self.daemon = False
+
+        def start(self):
+            return None
+
+    profile_home = tmp_path / "profiles" / "work"
+    monkeypatch.setattr(server, "_get_db", lambda: launch_db)
+    monkeypatch.setattr(
+        server,
+        "_db_for_request_profile",
+        lambda params: (profile_db, profile_home)
+        if params.get("profile") == "work"
+        else (launch_db, None),
+    )
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+
+    session, err = server._sess_nowait(
+        {"session_id": "profile-runtime", "profile": "work", "cwd": str(tmp_path)},
+        "rid-profile",
+    )
+
+    try:
+        assert err is None
+        assert session["session_key"] == "profile-stored"
+        assert session["profile_home"] == str(profile_home)
+        assert session["history"] == [
+            {"role": "user", "content": "profile history for profile-stored"}
+        ]
+    finally:
+        server._sessions.pop("profile-runtime", None)
+
+
+def test_sync_session_key_after_compress_updates_runtime_mapping(monkeypatch):
+    db = types.SimpleNamespace(_conn=sqlite3.connect(":memory:"))
+    db._conn.row_factory = sqlite3.Row
+    session = _session(agent=types.SimpleNamespace(session_id="stored-new"))
+    session["session_key"] = "stored-old"
+
+    monkeypatch.setattr(server, "_session_db", lambda _session: db)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda _session: None)
+
+    server._register_runtime_session(db, "runtime-1", "stored-old")
+    server._sync_session_key_after_compress("runtime-1", session)
+
+    assert session["session_key"] == "stored-new"
+    assert server._resolve_stored_id(db, "runtime-1") == "stored-new"
+
+
+def test_created_runtime_session_recovers_after_memory_loss(monkeypatch, tmp_path):
+    db = types.SimpleNamespace(_conn=sqlite3.connect(":memory:"))
+    db._conn.row_factory = sqlite3.Row
+    stored_rows = {}
+    messages_by_id = {}
+
+    def get_session(session_id):
+        return stored_rows.get(session_id)
+
+    def get_messages_as_conversation(session_id):
+        return messages_by_id.get(session_id, [])
+
+    db.get_session = get_session
+    db.get_messages_as_conversation = get_messages_as_conversation
+
+    class FakeTimer:
+        def __init__(self, _delay, _callback):
+            self.daemon = False
+
+        def start(self):
+            return None
+
+    monkeypatch.setattr(server, "_get_db", lambda: db)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_register_session_cwd", lambda _session: None)
+    monkeypatch.setattr(server.threading, "Timer", FakeTimer)
+
+    created = server.handle_request(
+        {
+            "id": "create-1",
+            "method": "session.create",
+            "params": {"cwd": str(tmp_path), "cols": 100},
+        }
+    )
+    runtime_id = created["result"]["session_id"]
+    stored_id = created["result"]["stored_session_id"]
+    stored_rows[stored_id] = {"id": stored_id, "input_tokens": 1, "output_tokens": 2}
+    messages_by_id[stored_id] = [{"role": "user", "content": "still here"}]
+    server._sessions.pop(runtime_id, None)
+
+    session, err = server._sess_nowait(
+        {"session_id": runtime_id, "cwd": str(tmp_path), "cols": 100}, "recover-1"
+    )
+
+    try:
+        assert err is None
+        assert session["session_key"] == stored_id
+        assert session["history"] == [{"role": "user", "content": "still here"}]
+        assert session["cols"] == 100
+    finally:
+        server._sessions.pop(runtime_id, None)
+
+
+def test_turn_end_history_persist_writes_messages(monkeypatch):
+    calls = {}
+
+    class FakeDB:
+        def replace_messages(self, session_id, messages):
+            calls["sid"] = session_id
+            calls["messages"] = messages
+
+    monkeypatch.setattr(server, "_get_db", lambda: FakeDB())
+    session = _session(session_key="stored-key")
+    history = [
+        {"role": "user", "content": "hey"},
+        {"role": "assistant", "content": "hello"},
+    ]
+
+    server._persist_session_history(session, history)
+
+    assert calls == {"sid": "stored-key", "messages": history}
+
+
+def test_turn_end_history_persist_survives_db_failure(monkeypatch):
+    class ExplodingDB:
+        def replace_messages(self, _session_id, _messages):
+            raise RuntimeError("disk full")
+
+    monkeypatch.setattr(server, "_get_db", lambda: ExplodingDB())
+    server._persist_session_history(_session(session_key="stored-key"), [])
+
+    monkeypatch.setattr(server, "_get_db", lambda: None)
+    server._persist_session_history(_session(session_key="stored-key"), [])
+
+
+def test_sess_nowait_rebinds_stdio_parked_session_to_live_ws():
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    class LiveTransport:
+        def write(self, *_args, **_kwargs):
+            return True
+
+    live = LiveTransport()
+    server._sessions["rebind-sid"] = _session(transport=server._stdio_transport)
+    token = bind_transport(live)
+    try:
+        session, err = server._sess_nowait({"session_id": "rebind-sid"}, "rid")
+
+        assert err is None
+        assert session["transport"] is live
+    finally:
+        reset_transport(token)
+        server._sessions.pop("rebind-sid", None)
+
+
+def test_sess_nowait_does_not_steal_from_live_transport():
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    class LiveTransport:
+        def write(self, *_args, **_kwargs):
+            return True
+
+    owner = LiveTransport()
+    intruder = LiveTransport()
+    server._sessions["owned-sid"] = _session(transport=owner)
+    token = bind_transport(intruder)
+    try:
+        session, err = server._sess_nowait({"session_id": "owned-sid"}, "rid")
+
+        assert err is None
+        assert session["transport"] is owner
+    finally:
+        reset_transport(token)
+        server._sessions.pop("owned-sid", None)
+
+
+def test_sess_nowait_leaves_real_stdio_gateway_untouched():
+    from tui_gateway.transport import bind_transport, reset_transport
+
+    server._sessions["stdio-sid"] = _session(transport=server._stdio_transport)
+    token = bind_transport(server._stdio_transport)
+    try:
+        session, err = server._sess_nowait({"session_id": "stdio-sid"}, "rid")
+
+        assert err is None
+        assert session["transport"] is server._stdio_transport
+    finally:
+        reset_transport(token)
+        server._sessions.pop("stdio-sid", None)
 
 
 class _ChunkyStdout:
@@ -701,7 +977,9 @@ def test_session_resume_uses_parent_lineage_for_display(monkeypatch):
         lambda agent, *a: {"model": "test", "tools": {}, "skills": {}},
     )
     monkeypatch.setattr(
-        server, "_init_session", lambda sid, key, agent, history, cols=80: None
+        server,
+        "_init_session",
+        lambda sid, key, agent, history, cols=80, profile_home=None: None,
     )
 
     resp = server.handle_request(
@@ -3240,7 +3518,17 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
             {"role": "assistant", "content": "edited reply"},
         ]
         assert server._sessions["sid"]["history_version"] == 2
-        assert stub_db.replaced == [("session-key", original_history[:2])]
+        assert stub_db.replaced == [
+            ("session-key", original_history[:2]),
+            (
+                "session-key",
+                [
+                    *original_history[:2],
+                    {"role": "user", "content": "edited second"},
+                    {"role": "assistant", "content": "edited reply"},
+                ],
+            ),
+        ]
     finally:
         server._sessions.pop("sid", None)
 
@@ -4729,6 +5017,7 @@ def test_browser_manage_connect_default_local_reports_launch_hint(monkeypatch):
     with patch.dict(sys.modules, {"tools.browser_tool": fake}):
         _stub_urlopen(monkeypatch, ok=False)
         with (
+            patch("platform.system", return_value="Linux"),
             patch(
                 "hermes_cli.browser_connect.try_launch_chrome_debug", return_value=False
             ),

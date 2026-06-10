@@ -464,6 +464,63 @@ def _get_db():
     return _db
 
 
+def _ensure_runtime_sessions_table(db) -> None:
+    """Create the runtime_id -> stored_id mapping table if needed."""
+    try:
+        db._conn.execute(
+            "CREATE TABLE IF NOT EXISTS runtime_sessions ("
+            "  runtime_id TEXT PRIMARY KEY,"
+            "  stored_id TEXT NOT NULL,"
+            "  mapped_at REAL NOT NULL DEFAULT (strftime('%s','now'))"
+            ")"
+        )
+    except Exception:
+        pass
+
+
+def _register_runtime_session(db, runtime_id: str, stored_id: str) -> None:
+    """Register a runtime_id -> stored_id mapping for restart recovery."""
+    if db is None or not runtime_id or not stored_id:
+        return
+    try:
+        _ensure_runtime_sessions_table(db)
+        db._conn.execute(
+            "INSERT OR REPLACE INTO runtime_sessions (runtime_id, stored_id) VALUES (?, ?)",
+            (runtime_id, stored_id),
+        )
+    except Exception:
+        logger.debug("failed to register runtime session mapping", exc_info=True)
+
+
+def _clear_runtime_session(db, runtime_id: str) -> None:
+    """Remove a runtime_id -> stored_id mapping, usually on session.close."""
+    if db is None or not runtime_id:
+        return
+    try:
+        _ensure_runtime_sessions_table(db)
+        db._conn.execute(
+            "DELETE FROM runtime_sessions WHERE runtime_id = ?",
+            (runtime_id,),
+        )
+    except Exception:
+        logger.debug("failed to clear runtime session mapping", exc_info=True)
+
+
+def _resolve_stored_id(db, runtime_id: str) -> str | None:
+    """Return the stored_id mapped to a runtime_id, if present."""
+    if db is None or not runtime_id:
+        return None
+    try:
+        _ensure_runtime_sessions_table(db)
+        row = db._conn.execute(
+            "SELECT stored_id FROM runtime_sessions WHERE runtime_id = ?",
+            (runtime_id,),
+        ).fetchone()
+        return row["stored_id"] if row else None
+    except Exception:
+        return None
+
+
 def _db_unavailable_error(rid, *, code: int):
     detail = _db_error or "state.db unavailable"
     return _err(rid, code, f"state.db unavailable: {detail}")
@@ -492,6 +549,33 @@ def _profile_home(profile: str | None) -> Path | None:
     if home.resolve() == Path(_hermes_home).resolve():
         return None
     return home if (home / "state.db").exists() or home.exists() else None
+
+
+def _open_profile_db(profile_home: str | Path | None):
+    """Open the SessionDB that belongs to a profile home."""
+    if not profile_home:
+        return _get_db()
+    try:
+        from hermes_state import SessionDB
+
+        return SessionDB(db_path=Path(profile_home) / "state.db")
+    except Exception:
+        logger.debug("failed to open profile db", exc_info=True)
+        return None
+
+
+def _db_for_request_profile(params: dict):
+    """Return (db, profile_home) for an RPC request's optional profile scope."""
+    profile = (params.get("profile") or "").strip() or None
+    profile_home = _profile_home(profile)
+    return _open_profile_db(profile_home), profile_home
+
+
+def _session_db(session: dict | None):
+    """Return the SessionDB that owns a live/recovered session."""
+    if not session:
+        return _get_db()
+    return _open_profile_db(session.get("profile_home"))
 
 
 def write_json(obj: dict) -> bool:
@@ -694,14 +778,12 @@ def _start_agent_build(sid: str, session: dict) -> None:
             session_db = None
             if profile_home:
                 home_token = set_hermes_home_override(profile_home)
-                try:
-                    from hermes_state import SessionDB
-
-                    session_db = SessionDB(db_path=Path(profile_home) / "state.db")
-                except Exception:
-                    session_db = None
+                session_db = _open_profile_db(profile_home)
             try:
                 agent = _make_agent(sid, key, session_db=session_db)
+                stored_usage = current.get("stored_usage")
+                if isinstance(stored_usage, dict):
+                    _restore_session_usage(agent, stored_usage)
             finally:
                 _clear_session_context(tokens)
 
@@ -769,7 +851,107 @@ def _start_agent_build(sid: str, session: dict) -> None:
 
 def _sess_nowait(params, rid):
     s = _sessions.get(params.get("session_id") or "")
-    return (s, None) if s else (None, _err(rid, 4001, "session not found"))
+    if s is not None:
+        _rebind_ws_transport(s)
+        return (s, None)
+    s = _recover_session_from_db(params.get("session_id") or "", params)
+    if s is not None:
+        _rebind_ws_transport(s)
+        return (s, None)
+    return (None, _err(rid, 4001, "session not found"))
+
+
+def _recover_session_from_db(sid: str, params: dict) -> dict | None:
+    """Recover a live session from state.db after a gateway process restart."""
+    if not sid:
+        return None
+    db, profile_home = _db_for_request_profile(params)
+    if db is None:
+        return None
+    try:
+        found = db.get_session(sid)
+    except Exception:
+        found = None
+    if not found:
+        stored_id = _resolve_stored_id(db, sid)
+        if not stored_id:
+            return None
+        try:
+            found = db.get_session(stored_id)
+        except Exception:
+            found = None
+    if not found:
+        return None
+
+    key = found.get("id") or sid
+    try:
+        history = db.get_messages_as_conversation(key)
+    except Exception:
+        history = []
+    try:
+        cols = int(params.get("cols", 80))
+    except (TypeError, ValueError):
+        cols = 80
+    now = time.time()
+    raw_cwd = str(params.get("cwd") or "").strip()
+    try:
+        explicit_cwd = bool(raw_cwd) and os.path.isdir(os.path.abspath(os.path.expanduser(raw_cwd)))
+    except Exception:
+        explicit_cwd = False
+    resolved_cwd = _completion_cwd(params)
+    ready = threading.Event()
+    with _sessions_lock:
+        _sessions[sid] = {
+            "agent": None,
+            "agent_error": None,
+            "agent_ready": ready,
+            "attached_images": [],
+            "cols": cols,
+            "created_at": now,
+            "edit_snapshots": {},
+            "explicit_cwd": explicit_cwd,
+            "history": history,
+            "history_lock": threading.Lock(),
+            "history_version": 0,
+            "image_counter": 0,
+            "cwd": resolved_cwd,
+            "inflight_turn": None,
+            "last_active": now,
+            "pending_title": None,
+            "profile_home": str(profile_home) if profile_home is not None else None,
+            "running": False,
+            "session_key": key,
+            "show_reasoning": _load_show_reasoning(),
+            "slash_worker": None,
+            "stored_usage": dict(found),
+            "tool_progress_mode": _load_tool_progress_mode(),
+            "tool_started_at": {},
+            "transport": current_transport() or _stdio_transport,
+        }
+        _register_session_cwd(_sessions[sid])
+    _enable_gateway_prompts()
+    _register_runtime_session(db, sid, key)
+
+    def _deferred_build() -> None:
+        session = _sessions.get(sid)
+        if session is not None:
+            _start_agent_build(sid, session)
+
+    build_timer = threading.Timer(0.05, _deferred_build)
+    build_timer.daemon = True
+    build_timer.start()
+    return _sessions[sid]
+
+
+def _rebind_ws_transport(session: dict | None) -> None:
+    """Upgrade a stdio-parked session to the calling live WebSocket transport."""
+    if not session:
+        return
+    transport = current_transport()
+    if transport is None or transport is _stdio_transport:
+        return
+    if session.get("transport") is _stdio_transport:
+        session["transport"] = transport
 
 
 def _sess(params, rid):
@@ -875,19 +1057,7 @@ def _ensure_session_db_row(session: dict) -> None:
     # Persist into the session's own profile db (global remote mode), not the
     # launch profile's — otherwise the row lands in the wrong state.db, the
     # unified list mis-tags it, and resume 404s ("session not found").
-    profile_home = session.get("profile_home")
-    if profile_home:
-        from hermes_state import SessionDB
-
-        try:
-            db = SessionDB(db_path=Path(profile_home) / "state.db")
-        except Exception:
-            logger.debug("failed to open profile db for session row", exc_info=True)
-            return
-        close_db = True
-    else:
-        db = _get_db()
-        close_db = False
+    db = _session_db(session)
     if db is None:
         return
     try:
@@ -899,12 +1069,20 @@ def _ensure_session_db_row(session: dict) -> None:
         )
     except Exception:
         logger.debug("failed to persist desktop session row", exc_info=True)
-    finally:
-        if close_db:
-            try:
-                db.close()
-            except Exception:
-                pass
+
+
+def _persist_session_history(session: dict, history: list) -> None:
+    """Persist a completed turn immediately so restarts cannot erase it."""
+    key = session.get("session_key")
+    if not key:
+        return
+    db = _session_db(session)
+    if db is None:
+        return
+    try:
+        db.replace_messages(key, history)
+    except Exception as exc:
+        print(f"[tui_gateway] turn-end history persist failed: {exc}", file=sys.stderr)
 
 
 def _set_session_cwd(session: dict, cwd: str) -> str:
@@ -916,7 +1094,7 @@ def _set_session_cwd(session: dict, cwd: str) -> str:
     # lazy row creation persist it too, not the launch-dir fallback).
     session["explicit_cwd"] = True
     _register_session_cwd(session)
-    db = _get_db()
+    db = _session_db(session)
     if db is not None:
         try:
             db.update_session_cwd(session.get("session_key", ""), resolved)
@@ -1636,6 +1814,8 @@ def _sync_session_key_after_compress(
 
     if clear_pending_title:
         session["pending_title"] = None
+    _register_runtime_session(_session_db(session), sid, new_session_id)
+    _register_session_cwd(session)
     if restart_slash_worker:
         try:
             _restart_slash_worker(session)
@@ -2612,7 +2792,14 @@ def _make_agent(sid: str, key: str, session_id: str | None = None, session_db=No
     )
 
 
-def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
+def _init_session(
+    sid: str,
+    key: str,
+    agent,
+    history: list,
+    cols: int = 80,
+    profile_home: str | Path | None = None,
+):
     now = time.time()
     with _sessions_lock:
         _sessions[sid] = {
@@ -2625,6 +2812,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
             "created_at": now,
             "last_active": now,
             "running": False,
+            "profile_home": str(profile_home) if profile_home is not None else None,
             "attached_images": [],
             "image_counter": 0,
             "cwd": _completion_cwd(),
@@ -2638,7 +2826,7 @@ def _init_session(sid: str, key: str, agent, history: list, cols: int = 80):
             # session (stdio for Ink, JSON-RPC WS for the dashboard sidebar).
             "transport": current_transport() or _stdio_transport,
         }
-    db = _get_db()
+    db = _session_db(_sessions.get(sid))
     if db is not None:
         row = db.get_session(key)
         if row and row.get("cwd"):
@@ -3070,6 +3258,7 @@ def _(rid, params: dict) -> dict:
             "transport": current_transport() or _stdio_transport,
         }
         _register_session_cwd(_sessions[sid])
+    _register_runtime_session(_session_db(_sessions.get(sid)), sid, key)
     # NOTE: we intentionally do NOT persist a DB row here. Every TUI/desktop
     # launch (and every "New agent" / draft) opens a session here just to paint
     # the composer, so eagerly creating a row left an "Untitled" empty session
@@ -3212,17 +3401,9 @@ def _(rid, params: dict) -> dict:
         cols = 80
     # ``profile`` (app-global remote mode): resume a session that lives in another
     # local profile's state.db. None/own profile → the launch profile (unchanged).
-    profile = (params.get("profile") or "").strip() or None
-    profile_home = _profile_home(profile)
-
     # In a profile scope, the agent OWNS a long-lived db handle bound to that
     # profile (do NOT auto-close it here). Otherwise reuse the shared launch db.
-    if profile_home is not None:
-        from hermes_state import SessionDB
-
-        db = SessionDB(db_path=profile_home / "state.db")
-    else:
-        db = _get_db()
+    db, profile_home = _db_for_request_profile(params)
     if db is None:
         return _db_unavailable_error(rid, code=5000)
 
@@ -3305,14 +3486,10 @@ def _(rid, params: dict) -> dict:
             payload["resumed"] = target
             return _ok(rid, payload)
         try:
-            _init_session(sid, target, agent, history, cols=cols)
+            _init_session(sid, target, agent, history, cols=cols, profile_home=profile_home)
+            _register_runtime_session(db, sid, target)
             if sid in _sessions:
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
-                # Remember the profile home so each turn re-binds HERMES_HOME (the
-                # agent persists to its own db, but mid-turn home reads — memory,
-                # skills — must resolve to the resumed profile too).
-                if profile_home is not None:
-                    _sessions[sid]["profile_home"] = str(profile_home)
         except Exception as e:
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
@@ -3933,6 +4110,7 @@ def _(rid, params: dict) -> dict:
         if not session:
             return _ok(rid, {"closed": False})
         _teardown_session(session)
+    _clear_runtime_session(_session_db(session), sid)
     return _ok(rid, {"closed": True})
 
 
@@ -4688,6 +4866,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
 
             last_reasoning = None
             status_note = None
+            turn_history = None
             if isinstance(result, dict):
                 if isinstance(result.get("messages"), list):
                     with session["history_lock"]:
@@ -4695,6 +4874,7 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                         if current_version == history_version:
                             session["history"] = result["messages"]
                             session["history_version"] = history_version + 1
+                            turn_history = list(result["messages"])
                         else:
                             # History mutated externally during the turn
                             # (undo/compress/retry/rollback now guard on
@@ -4724,6 +4904,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 _sync_session_key_after_compress(
                     sid, session, clear_pending_title=False, restart_slash_worker=True,
                 )
+
+                if turn_history is not None:
+                    _persist_session_history(session, turn_history)
 
                 raw = result.get("final_response", "")
                 status = (
