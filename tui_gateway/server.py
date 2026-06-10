@@ -184,12 +184,18 @@ _LONG_HANDLERS = frozenset(
     }
 )
 
-try:
-    _rpc_pool_workers = max(
-        2, int(os.environ.get("HERMES_TUI_RPC_POOL_WORKERS") or "4")
-    )
-except (ValueError, TypeError):
-    _rpc_pool_workers = 4
+def _resolve_rpc_pool_workers() -> int:
+    default_workers = max(8, min(32, (os.cpu_count() or 4) * 2))
+    override = os.environ.get("HERMES_TUI_RPC_POOL_WORKERS")
+    if not override:
+        return default_workers
+    try:
+        return max(2, int(override))
+    except (ValueError, TypeError):
+        return default_workers
+
+
+_rpc_pool_workers = _resolve_rpc_pool_workers()
 _pool = concurrent.futures.ThreadPoolExecutor(
     max_workers=_rpc_pool_workers,
     thread_name_prefix="tui-rpc",
