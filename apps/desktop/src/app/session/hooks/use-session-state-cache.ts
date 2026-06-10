@@ -32,6 +32,7 @@ export function useSessionStateCache({
   const sessionStateByRuntimeIdRef = useRef(new Map<string, ClientSessionState>())
   const runtimeIdByStoredSessionIdRef = useRef(new Map<string, string>())
   const pendingViewStateRef = useRef<{ sessionId: string; state: ClientSessionState } | null>(null)
+  const renderedStoredSessionIdRef = useRef<string | null>(selectedStoredSessionId)
   const viewSyncRafRef = useRef<number | null>(null)
 
   useEffect(() => {
@@ -88,7 +89,13 @@ export function useSessionStateCache({
       return
     }
 
-    setMessages(preserveLocalAssistantErrors(pending.state.messages, $messages.get()))
+    const currentMessages =
+      pending.state.storedSessionId && pending.state.storedSessionId === renderedStoredSessionIdRef.current
+        ? $messages.get()
+        : []
+
+    setMessages(preserveLocalAssistantErrors(pending.state.messages, currentMessages))
+    renderedStoredSessionIdRef.current = pending.state.storedSessionId
     setBusy(pending.state.busy)
     setMutableRef(busyRef, pending.state.busy)
     setAwaitingResponse(pending.state.awaitingResponse)
