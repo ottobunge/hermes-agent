@@ -439,6 +439,8 @@ export function useSessionActions({
     async (storedSessionId: string, replaceRoute = false) => {
       const requestId = resumeRequestRef.current + 1
       resumeRequestRef.current = requestId
+      const previousStoredSessionId = selectedStoredSessionIdRef.current
+      const preserveLocalErrors = previousStoredSessionId === storedSessionId
 
       const isCurrentResume = () =>
         resumeRequestRef.current === requestId && selectedStoredSessionIdRef.current === storedSessionId
@@ -530,13 +532,14 @@ export function useSessionActions({
         // That is the ctrl+R flash chain. Avoid showing an empty thread
         // while we already have a route-scoped session id, and don't race the
         // local snapshot against gateway resume.
-        let localSnapshot = $messages.get()
+        let localSnapshot = preserveLocalErrors ? $messages.get() : []
 
         try {
           const storedMessages = await getSessionMessages(storedSessionId, sessionProfile)
 
           if (isCurrentResume()) {
-            localSnapshot = preserveLocalAssistantErrors(toChatMessages(storedMessages.messages), $messages.get())
+            const currentMessages = preserveLocalErrors ? $messages.get() : []
+            localSnapshot = preserveLocalAssistantErrors(toChatMessages(storedMessages.messages), currentMessages)
 
             if (!chatMessageArraysEquivalent($messages.get(), localSnapshot)) {
               setMessages(localSnapshot)
@@ -581,7 +584,10 @@ export function useSessionActions({
               ? currentMessages
               : resumedMessages
 
-        const messagesForView = preserveLocalAssistantErrors(preferredMessages, currentMessages)
+        const messagesForView = preserveLocalAssistantErrors(
+          preferredMessages,
+          preserveLocalErrors ? currentMessages : []
+        )
 
         setActiveSessionId(resumed.session_id)
         activeSessionIdRef.current = resumed.session_id
@@ -617,7 +623,12 @@ export function useSessionActions({
           return
         }
 
-        setMessages(preserveLocalAssistantErrors(toChatMessages(fallback.messages), $messages.get()))
+        setMessages(
+          preserveLocalAssistantErrors(
+            toChatMessages(fallback.messages),
+            preserveLocalErrors ? $messages.get() : []
+          )
+        )
         notifyError(err, 'Resume failed')
       } finally {
         if (isCurrentResume()) {
