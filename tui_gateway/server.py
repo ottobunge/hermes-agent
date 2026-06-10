@@ -593,6 +593,16 @@ def _session_db(session: dict | None):
     return db
 
 
+def _close_profile_db_handle(db, profile_home: str | Path | None) -> None:
+    """Close a short-lived profile DB handle without touching the shared launch DB."""
+    if profile_home is None or db is None or not hasattr(db, "close"):
+        return
+    try:
+        db.close()
+    except Exception:
+        pass
+
+
 def write_json(obj: dict) -> bool:
     """Emit one JSON frame. Routes via the most-specific transport available.
 
@@ -3439,6 +3449,7 @@ def _(rid, params: dict) -> dict:
         if found:
             target = found["id"]
         else:
+            _close_profile_db_handle(db, profile_home)
             return _err(rid, 4007, "session not found")
     # Fast path: if the session is already live, reuse it under the lock.
     with _session_resume_lock:
@@ -3453,6 +3464,7 @@ def _(rid, params: dict) -> dict:
                 transport=current_transport() or _stdio_transport,
             )
             payload["resumed"] = target
+            _close_profile_db_handle(db, profile_home)
             return _ok(rid, payload)
 
     # Build the agent OUTSIDE the lock — _make_agent can block for seconds
@@ -3464,6 +3476,7 @@ def _(rid, params: dict) -> dict:
     home_token = (
         set_hermes_home_override(str(profile_home)) if profile_home is not None else None
     )
+    db_transferred = False
     try:
         db.reopen_session(target)
         history = db.get_messages_as_conversation(target)
@@ -3485,6 +3498,7 @@ def _(rid, params: dict) -> dict:
         finally:
             _clear_session_context(tokens)
     except Exception as e:
+        _close_profile_db_handle(db, profile_home)
         return _err(rid, 5000, f"resume failed: {e}")
     finally:
         if home_token is not None:
@@ -3501,6 +3515,7 @@ def _(rid, params: dict) -> dict:
                     agent.close()
             except Exception:
                 pass
+            _close_profile_db_handle(db, profile_home)
             other_sid, other_session = live
             payload = _live_session_payload(
                 other_sid,
@@ -3521,10 +3536,13 @@ def _(rid, params: dict) -> dict:
                 profile_home=profile_home,
                 session_db=db if profile_home is not None else None,
             )
+            db_transferred = profile_home is not None
             _register_runtime_session(db, sid, target)
             if sid in _sessions:
                 _sessions[sid]["display_history_prefix"] = display_history_prefix
         except Exception as e:
+            if not db_transferred:
+                _close_profile_db_handle(db, profile_home)
             return _err(rid, 5000, f"resume failed: {e}")
         session = _sessions.get(sid) or {}
     return _ok(

@@ -1155,6 +1155,66 @@ def test_session_resume_caches_agent_profile_db(monkeypatch, tmp_path):
         server._sessions.pop(sid, None)
 
 
+def test_session_resume_closes_profile_db_when_race_loses(monkeypatch, tmp_path):
+    captured = {"agent_closed": False}
+
+    class FakeDB:
+        def __init__(self):
+            self.closed = False
+
+        def get_session(self, target):
+            return {"id": target}
+
+        def get_session_by_title(self, _target):
+            return None
+
+        def reopen_session(self, _target):
+            return None
+
+        def get_messages_as_conversation(self, target, include_ancestors=False):
+            return [{"role": "user", "content": f"history {target}"}]
+
+        def close(self):
+            self.closed = True
+
+    profile_db = FakeDB()
+    winner = _session(session_key="stored")
+    calls = {"find": 0}
+
+    def fake_find(_target):
+        calls["find"] += 1
+        return None if calls["find"] == 1 else ("winner", winner)
+
+    def fake_make_agent(_sid, _key, session_id=None, session_db=None):
+        captured["session_db"] = session_db
+
+        def close():
+            captured["agent_closed"] = True
+
+        return types.SimpleNamespace(model="test", session_id=session_id, close=close)
+
+    monkeypatch.setattr(server, "_db_for_request_profile", lambda _params: (profile_db, tmp_path / "profile"))
+    monkeypatch.setattr(server, "_find_live_session_by_key", fake_find)
+    monkeypatch.setattr(server, "_enable_gateway_prompts", lambda: None)
+    monkeypatch.setattr(server, "_set_session_context", lambda _target: [])
+    monkeypatch.setattr(server, "_clear_session_context", lambda _tokens: None)
+    monkeypatch.setattr(server, "_make_agent", fake_make_agent)
+    monkeypatch.setattr(server, "_live_session_payload", lambda sid, session, **_kwargs: {"session_id": sid})
+
+    resp = server.handle_request(
+        {
+            "id": "1",
+            "method": "session.resume",
+            "params": {"session_id": "stored", "profile": "work"},
+        }
+    )
+
+    assert resp["result"]["session_id"] == "winner"
+    assert captured["session_db"] is profile_db
+    assert captured["agent_closed"] is True
+    assert profile_db.closed is True
+
+
 def test_status_callback_emits_kind_and_text():
     with patch("tui_gateway.server._emit") as emit:
         cb = server._agent_cbs("sid")["status_callback"]
