@@ -56,13 +56,18 @@ export function useRouteResume({
   startFreshSessionDraft
 }: RouteResumeOptions) {
   const lastPathnameRef = useRef<string | null>(null)
+  const seenGatewayStateRef = useRef(false)
   const wasGatewayOpenRef = useRef(false)
 
   useEffect(() => {
     const gatewayOpen = gatewayState === 'open'
     const pathnameChanged = lastPathnameRef.current !== locationPathname
-    const gatewayBecameOpen = !wasGatewayOpenRef.current && gatewayOpen
+    // Only treat a real closed -> open transition as a reconnect. A session can
+    // mount while the gateway is already open, and that initial render should
+    // not double-resume the route.
+    const gatewayBecameOpen = seenGatewayStateRef.current && !wasGatewayOpenRef.current && gatewayOpen
     lastPathnameRef.current = locationPathname
+    seenGatewayStateRef.current = true
     wasGatewayOpenRef.current = gatewayOpen
 
     if (currentView !== 'chat' || !gatewayOpen) {
@@ -82,7 +87,10 @@ export function useRouteResume({
       // before the pathname updates from /:sid -> /.
       const shouldResume = pathnameChanged || gatewayBecameOpen
 
-      if (!alreadyActive && shouldResume && !creatingSessionRef.current) {
+      // On reconnect, resume even when the route still looks active: the cached
+      // runtime id can point at a gateway session that was reaped/rebound while
+      // the socket was down, which otherwise strands the renderer on a dead id.
+      if ((gatewayBecameOpen || !alreadyActive) && shouldResume && !creatingSessionRef.current) {
         void resumeSession(routedSessionId, true)
       }
 
