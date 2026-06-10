@@ -348,7 +348,7 @@ def _finalize_session(session: dict | None, end_reason: str = "tui_close") -> No
     # continuation. Fix for #20001.
     if session_id:
         try:
-            db = _get_db()
+            db = _session_db(session)
             if db is not None:
                 db.end_session(session_id, end_reason)
         except Exception:
@@ -382,6 +382,12 @@ def _teardown_session(session: dict | None) -> None:
         worker = session.get("slash_worker")
         if worker:
             worker.close()
+    except Exception:
+        pass
+    try:
+        db = session.pop("session_db", None)
+        if db is not None and hasattr(db, "close"):
+            db.close()
     except Exception:
         pass
 
@@ -575,7 +581,16 @@ def _session_db(session: dict | None):
     """Return the SessionDB that owns a live/recovered session."""
     if not session:
         return _get_db()
-    return _open_profile_db(session.get("profile_home"))
+    db = session.get("session_db")
+    if db is not None:
+        return db
+    profile_home = session.get("profile_home")
+    if not profile_home:
+        return _get_db()
+    db = _open_profile_db(profile_home)
+    if db is not None:
+        session["session_db"] = db
+    return db
 
 
 def write_json(obj: dict) -> bool:
@@ -4491,7 +4506,7 @@ def _(rid, params: dict) -> dict:
             truncated = history[: user_indices[ordinal]]
             session["history"] = truncated
             session["history_version"] = int(session.get("history_version", 0)) + 1
-            if (db := _get_db()) is not None:
+            if (db := _session_db(session)) is not None:
                 try:
                     db.replace_messages(session["session_key"], truncated)
                 except Exception as exc:

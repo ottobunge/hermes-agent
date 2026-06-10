@@ -27,6 +27,7 @@ import asyncio
 import concurrent.futures
 import json
 import logging
+import threading
 from typing import Any
 
 from tui_gateway import server
@@ -41,6 +42,7 @@ _WRITE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
 # Max seconds the write executor will wait for the event loop to flush a
 # frame before marking the transport dead.
 _WS_WRITE_TIMEOUT_S = 30.0
+_WS_MAX_PENDING_WRITES = 128
 _WS_LOG_PAYLOAD_PREVIEW = 240
 
 # Keep starlette optional at import time; handle_ws uses the real class when
@@ -70,12 +72,14 @@ class WSTransport:
         *,
         peer: str = "unknown",
     ) -> None:
-        self._ws = ws
-        self._loop = loop
-        self._peer = peer
-        self._closed = False
+        self._ws: Any = ws
+        self._loop: asyncio.AbstractEventLoop = loop
+        self._peer: str = peer
+        self._closed: bool = False
+        self._pending_writes: int = 0
+        self._pending_lock: threading.Lock = threading.Lock()
 
-    def write(self, obj: dict) -> bool:
+    def write(self, obj: dict[str, Any]) -> bool:
         if self._closed:
             return False
 
@@ -93,13 +97,17 @@ class WSTransport:
         try:
             from agent.async_utils import safe_schedule_threadsafe
 
+            if not self._reserve_pending_write():
+                return False
             fut = safe_schedule_threadsafe(self._safe_send(line), self._loop)
             if fut is None:
+                self._release_pending_write()
                 self._closed = True
                 return False
             _WRITE_EXECUTOR.submit(self._await_write, fut)
             return True
         except Exception as exc:
+            self._release_pending_write()
             _log.warning(
                 "ws schedule failed peer=%s error_type=%s error=%s",
                 self._peer,
@@ -108,14 +116,14 @@ class WSTransport:
             )
             return False
 
-    async def write_async(self, obj: dict) -> bool:
+    async def write_async(self, obj: dict[str, Any]) -> bool:
         """Send from the owning event loop. Awaits until the frame is on the wire."""
         if self._closed:
             return False
         await self._safe_send(json.dumps(obj, ensure_ascii=False))
         return not self._closed
 
-    def _await_write(self, fut: concurrent.futures.Future) -> None:
+    def _await_write(self, fut: concurrent.futures.Future[Any]) -> None:
         try:
             fut.result(timeout=_WS_WRITE_TIMEOUT_S)
         except concurrent.futures.TimeoutError:
@@ -127,6 +135,28 @@ class WSTransport:
             )
         except Exception:
             pass
+        finally:
+            self._release_pending_write()
+
+    def _reserve_pending_write(self) -> bool:
+        with self._pending_lock:
+            if self._closed:
+                return False
+            if self._pending_writes >= _WS_MAX_PENDING_WRITES:
+                self._closed = True
+                _log.warning(
+                    "ws write backlog exceeded limit=%d peer=%s",
+                    _WS_MAX_PENDING_WRITES,
+                    self._peer,
+                )
+                return False
+            self._pending_writes += 1
+            return True
+
+    def _release_pending_write(self) -> None:
+        with self._pending_lock:
+            if self._pending_writes > 0:
+                self._pending_writes -= 1
 
     async def _safe_send(self, line: str) -> None:
         try:

@@ -195,6 +195,51 @@ def test_sync_session_key_after_compress_updates_runtime_mapping(monkeypatch):
     assert server._resolve_stored_id(db, "runtime-1") == "stored-new"
 
 
+def test_session_db_caches_profile_db_and_teardown_closes(monkeypatch, tmp_path):
+    class FakeDB:
+        def __init__(self):
+            self.closed = False
+
+        def close(self):
+            self.closed = True
+
+    opened = []
+
+    def fake_open(profile_home):
+        db = FakeDB()
+        opened.append((profile_home, db))
+        return db
+
+    session = _session(profile_home=str(tmp_path / "profile"))
+    monkeypatch.setattr(server, "_open_profile_db", fake_open)
+    monkeypatch.setattr(server, "_finalize_session", lambda _session: None)
+
+    first = server._session_db(session)
+    second = server._session_db(session)
+    server._teardown_session(session)
+
+    assert first is second
+    assert len(opened) == 1
+    assert first.closed is True
+
+
+def test_finalize_session_uses_session_db(monkeypatch):
+    calls = {}
+
+    class FakeDB:
+        def end_session(self, session_id, reason):
+            calls["ended"] = (session_id, reason)
+
+    agent = types.SimpleNamespace(session_id="profile-session")
+    session = _session(agent=agent, session_key="stored-key")
+    monkeypatch.setattr(server, "_session_db", lambda _session: FakeDB())
+    monkeypatch.setattr(server, "_notify_session_boundary", lambda *_args, **_kwargs: None)
+
+    server._finalize_session(session, end_reason="test-close")
+
+    assert calls["ended"] == ("profile-session", "test-close")
+
+
 def test_created_runtime_session_recovers_after_memory_loss(monkeypatch, tmp_path):
     db = types.SimpleNamespace(_conn=sqlite3.connect(":memory:"))
     db._conn.row_factory = sqlite3.Row
@@ -3529,6 +3574,72 @@ def test_prompt_submit_can_truncate_before_user_ordinal(monkeypatch):
                 ],
             ),
         ]
+    finally:
+        server._sessions.pop("sid", None)
+
+
+def test_prompt_submit_truncation_uses_session_db(monkeypatch):
+    class _Agent:
+        def run_conversation(self, prompt, conversation_history=None, stream_callback=None):
+            return {
+                "final_response": "edited reply",
+                "messages": [
+                    *(conversation_history or []),
+                    {"role": "user", "content": prompt},
+                    {"role": "assistant", "content": "edited reply"},
+                ],
+            }
+
+    class _ImmediateThread:
+        def __init__(self, target=None, daemon=None, **_kwargs):
+            self._target = target
+
+        def start(self):
+            self._target()
+
+    class _SessionDb:
+        def __init__(self):
+            self.replaced = []
+
+        def replace_messages(self, session_id, messages):
+            self.replaced.append((session_id, list(messages)))
+
+    launch_db = _SessionDb()
+    profile_db = _SessionDb()
+    original_history = [
+        {"role": "user", "content": "first"},
+        {"role": "assistant", "content": "first reply"},
+        {"role": "user", "content": "second"},
+    ]
+    server._sessions["sid"] = _session(
+        agent=_Agent(),
+        history=original_history,
+        session_db=profile_db,
+        session_key="profile-key",
+    )
+
+    try:
+        monkeypatch.setattr(server.threading, "Thread", _ImmediateThread)
+        monkeypatch.setattr(server, "_get_usage", lambda _a: {})
+        monkeypatch.setattr(server, "render_message", lambda _t, _c: "")
+        monkeypatch.setattr(server, "_emit", lambda *a: None)
+        monkeypatch.setattr(server, "_get_db", lambda: launch_db)
+
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "prompt.submit",
+                "params": {
+                    "session_id": "sid",
+                    "text": "edited second",
+                    "truncate_before_user_ordinal": 1,
+                },
+            }
+        )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert profile_db.replaced[0] == ("profile-key", original_history[:2])
+        assert launch_db.replaced == []
     finally:
         server._sessions.pop("sid", None)
 
