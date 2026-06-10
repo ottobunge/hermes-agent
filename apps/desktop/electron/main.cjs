@@ -50,6 +50,7 @@ const {
   resolveReadableFileForIpc,
   resolveTimeoutMs
 } = require('./hardening.cjs')
+const { waitForRemoteHermes: waitForRemoteHermesWithBackoff } = require('./desktop-remote-reconnect.cjs')
 
 let nodePty = null
 
@@ -2857,6 +2858,19 @@ async function waitForHermes(baseUrl, token) {
   throw new Error(`Hermes backend did not become ready: ${lastError?.message || 'timeout'}`)
 }
 
+async function waitForRemoteHermes(baseUrl, token) {
+  try {
+    await waitForRemoteHermesWithBackoff(baseUrl, token, {
+      fetcher: fetchJson,
+      fetcherOptions: { timeoutMs: 8_000 },
+      maxAttempts: 16,
+      timeoutMs: 90_000
+    })
+  } catch (error) {
+    throw new Error(`Hermes remote backend did not become ready: ${error.message}`)
+  }
+}
+
 function getWindowButtonPosition() {
   if (!IS_MAC) return null
   return mainWindow?.getWindowButtonPosition?.() || WINDOW_BUTTON_POSITION
@@ -4255,7 +4269,7 @@ async function spawnPoolBackend(profile, entry) {
   // tolerate.
   const remote = await resolveRemoteBackend(profile)
   if (remote) {
-    await waitForHermes(remote.baseUrl, remote.token)
+    await waitForRemoteHermes(remote.baseUrl, remote.token)
     return {
       ...remote,
       profile,
@@ -4367,7 +4381,7 @@ async function startHermes() {
     const remote = await resolveRemoteBackend(primaryProfileKey())
     if (remote) {
       await advanceBootProgress('backend.remote', `Connecting to remote Hermes backend at ${remote.baseUrl}`, 24)
-      await waitForHermes(remote.baseUrl, remote.token)
+      await waitForRemoteHermes(remote.baseUrl, remote.token)
       updateBootProgress({
         phase: 'backend.ready',
         message: 'Remote Hermes backend is ready',
