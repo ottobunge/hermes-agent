@@ -501,6 +501,11 @@ class CodexAppServerSession:
                     pending = self._client.take_notification(timeout=0)
                     if pending is None:
                         break
+                    if self._on_event is not None:
+                        try:
+                            self._on_event(pending)
+                        except Exception:  # pragma: no cover - display callback
+                            logger.debug("on_event callback raised", exc_info=True)
                     self._track_pending_file_change(pending)
                     proj = projector.project(pending)
                     if proj.messages:
