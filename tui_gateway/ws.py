@@ -24,6 +24,7 @@ Mounting
 from __future__ import annotations
 
 import asyncio
+import concurrent.futures
 import json
 import logging
 from typing import Any
@@ -32,9 +33,13 @@ from tui_gateway import server
 
 _log = logging.getLogger(__name__)
 
-# Max seconds a pool-dispatched handler will block waiting for the event loop
-# to flush a WS frame before we mark the transport dead. Protects handler
-# threads from a wedged socket.
+_WRITE_EXECUTOR = concurrent.futures.ThreadPoolExecutor(
+    max_workers=2,
+    thread_name_prefix="tui-ws-write",
+)
+
+# Max seconds the write executor will wait for the event loop to flush a
+# frame before marking the transport dead.
 _WS_WRITE_TIMEOUT_S = 30.0
 _WS_LOG_PAYLOAD_PREVIEW = 240
 
@@ -49,17 +54,13 @@ except ImportError:  # pragma: no cover - starlette is a required install path
 class WSTransport:
     """Per-connection WS transport.
 
-    ``write`` is safe to call from any thread *other than* the event loop
-    thread that owns the socket. Pool workers (the only real caller) run in
-    their own threads, so marshalling onto the loop via
-    :func:`asyncio.run_coroutine_threadsafe` + ``future.result()`` is correct
-    and deadlock-free there.
+    ``write`` is safe to call from any thread. From the event loop thread
+    we use fire-and-forget. From worker threads we schedule ``_safe_send``
+    on the event loop and offload the blocking ``fut.result()`` wait to a
+    tiny write executor so RPC workers are not consumed by slow socket I/O.
 
-    When called from the loop thread itself (e.g. by ``handle_ws`` for an
-    inline response) the same call would deadlock: we'd schedule work onto
-    the loop we're currently blocking. We detect that case and fire-and-
-    forget instead. Callers that need to know when the bytes are on the wire
-    should use :meth:`write_async` from the loop thread.
+    Callers that need to know when the bytes are on the wire should use
+    :meth:`write_async` from the loop thread.
     """
 
     def __init__(
@@ -86,23 +87,24 @@ class WSTransport:
             on_loop = False
 
         if on_loop:
-            # Fire-and-forget — don't block the loop waiting on itself.
             self._loop.create_task(self._safe_send(line))
             return True
 
         try:
             from agent.async_utils import safe_schedule_threadsafe
+
             fut = safe_schedule_threadsafe(self._safe_send(line), self._loop)
             if fut is None:
                 self._closed = True
                 return False
-            fut.result(timeout=_WS_WRITE_TIMEOUT_S)
-            return not self._closed
+            _WRITE_EXECUTOR.submit(self._await_write, fut)
+            return True
         except Exception as exc:
-            self._closed = True
             _log.warning(
-                "ws write failed peer=%s error_type=%s error=%s",
-                self._peer, type(exc).__name__, exc,
+                "ws schedule failed peer=%s error_type=%s error=%s",
+                self._peer,
+                type(exc).__name__,
+                exc,
             )
             return False
 
@@ -113,6 +115,19 @@ class WSTransport:
         await self._safe_send(json.dumps(obj, ensure_ascii=False))
         return not self._closed
 
+    def _await_write(self, fut: concurrent.futures.Future) -> None:
+        try:
+            fut.result(timeout=_WS_WRITE_TIMEOUT_S)
+        except concurrent.futures.TimeoutError:
+            self._closed = True
+            _log.warning(
+                "ws write timed out after %.0fs peer=%s (event loop stalled)",
+                _WS_WRITE_TIMEOUT_S,
+                self._peer,
+            )
+        except Exception:
+            pass
+
     async def _safe_send(self, line: str) -> None:
         try:
             await self._ws.send_text(line)
@@ -120,7 +135,9 @@ class WSTransport:
             self._closed = True
             _log.warning(
                 "ws send failed peer=%s error_type=%s error=%s",
-                self._peer, type(exc).__name__, exc,
+                self._peer,
+                type(exc).__name__,
+                exc,
             )
 
     def close(self) -> None:
