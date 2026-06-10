@@ -4010,6 +4010,11 @@ def _(rid, params: dict) -> dict:
         resolve_gateway_approval(session["session_key"], "deny", resolve_all=True)
     except Exception:
         pass
+    sid = params.get("session_id", "")
+    agent = session.get("agent")
+    with session["history_lock"]:
+        session["running"] = False
+    _emit("session.info", sid, _session_info(agent, session))
     return _ok(rid, {"status": "interrupted"})
 
 

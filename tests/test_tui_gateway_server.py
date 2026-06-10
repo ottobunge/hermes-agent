@@ -3332,6 +3332,32 @@ def test_interrupt_clears_multiple_own_pending():
             server._answers.pop(key, None)
 
 
+def test_interrupt_emits_session_info_with_running_false():
+    emitted = []
+
+    def fake_emit(event, sid, data):
+        emitted.append((event, sid, data))
+
+    sess = _session(types.SimpleNamespace(interrupt=lambda: None))
+    sess["running"] = True
+    server._sessions["sid"] = sess
+
+    try:
+        with patch.object(server, "_emit", fake_emit):
+            resp = server.handle_request(
+                {"id": "1", "method": "session.interrupt", "params": {"session_id": "sid"}}
+            )
+
+        assert resp.get("result"), f"got error: {resp.get('error')}"
+        assert sess["running"] is False
+        assert any(
+            event == "session.info" and sid == "sid" and data.get("running") is False
+            for event, sid, data in emitted
+        )
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_clear_pending_without_sid_clears_all():
     """_clear_pending(None) is the shutdown path — must still release
     every pending prompt regardless of owning session."""
