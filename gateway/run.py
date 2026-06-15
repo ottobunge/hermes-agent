@@ -11002,6 +11002,7 @@ class GatewayRunner:
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+          /model <name> --force               — bypass provider model-list validation
         """
         import yaml
         from hermes_cli.model_switch import (
@@ -11013,8 +11014,8 @@ class GatewayRunner:
 
         raw_args = event.get_command_args().strip()
 
-        # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        # Parse --provider, --global, --refresh, and --force flags
+        model_input, explicit_provider, persist_global, force_refresh, force_model = parse_model_flags(raw_args)
 
         # --refresh: bust the disk cache so the picker shows live data.
         if force_refresh:
@@ -11256,6 +11257,7 @@ class GatewayRunner:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            force=force_model,
         )
 
         if not result.success:
