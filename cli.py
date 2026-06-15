@@ -7108,6 +7108,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             is_global_flag,
             force_refresh,
             is_session,
+            force_model,
         ) = parse_model_flags(raw_args)
         # Resolve the effective persistence once: --session overrides the
         # config-gated default, --global forces persist, otherwise defer to
@@ -7187,6 +7188,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            force=force_model,
         )
 
         if not result.success:

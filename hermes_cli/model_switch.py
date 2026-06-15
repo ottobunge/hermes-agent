@@ -23,7 +23,7 @@ from __future__ import annotations
 import logging
 import re
 from dataclasses import dataclass
-from typing import List, NamedTuple, Optional
+from typing import Any, List, NamedTuple, Optional
 
 from hermes_cli.providers import (
     ProviderDef,
@@ -299,35 +299,39 @@ class ModelSwitchResult:
 # Flag parsing
 # ---------------------------------------------------------------------------
 
-def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
-    """Parse --provider, --global, --session, and --refresh flags from /model command args.
+def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool, bool]:
+    """Parse --provider, --global, --session, --refresh, and --force flags.
 
-    Returns ``(model_input, explicit_provider, is_global, force_refresh, is_session)``.
+    Returns ``(model_input, explicit_provider, is_global, force_refresh,
+    is_session, force_model)``.
 
     ``is_global`` and ``is_session`` are independent flag presences; the
     *effective* persistence decision is resolved by
     :func:`resolve_persist_behavior` so the config-gated default
-    (``model.persist_switch_by_default``) is applied in one place.
+    (``model.persist_switch_by_default``) is applied in one place. ``force_model``
+    bypasses provider model-list validation for hidden/stale models.
 
     Examples::
 
-        "sonnet"                         -> ("sonnet", "", False, False, False)
-        "sonnet --global"                -> ("sonnet", "", True, False, False)
-        "sonnet --session"               -> ("sonnet", "", False, False, True)
-        "sonnet --provider anthropic"    -> ("sonnet", "anthropic", False, False, False)
-        "--provider my-ollama"           -> ("", "my-ollama", False, False, False)
-        "--refresh"                      -> ("", "", False, True, False)
-        "sonnet --provider anthropic --global" -> ("sonnet", "anthropic", True, False, False)
+        "sonnet"                         -> ("sonnet", "", False, False, False, False)
+        "sonnet --global"                -> ("sonnet", "", True, False, False, False)
+        "sonnet --session"               -> ("sonnet", "", False, False, True, False)
+        "sonnet --provider anthropic"    -> ("sonnet", "anthropic", False, False, False, False)
+        "--provider my-ollama"           -> ("", "my-ollama", False, False, False, False)
+        "--refresh"                      -> ("", "", False, True, False, False)
+        "zai/glm-5.2 --force"            -> ("zai/glm-5.2", "", False, False, False, True)
+        "sonnet --provider anthropic --global" -> ("sonnet", "anthropic", True, False, False, False)
     """
     is_global = False
     explicit_provider = ""
     force_refresh = False
     is_session = False
+    force_model = False
 
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
-    raw_args = _re.sub(r'[\u2012\u2013\u2014\u2015](provider|global|session|refresh)', r'--\1', raw_args)
+    raw_args = _re.sub(r'[‒–—―](provider|global|session|refresh|force)', r'--', raw_args)
 
     # Extract --global
     if "--global" in raw_args:
@@ -344,6 +348,11 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
         force_refresh = True
         raw_args = raw_args.replace("--refresh", "").strip()
 
+    # Extract --force (bypass provider model-list validation for hidden/stale models)
+    if "--force" in raw_args:
+        force_model = True
+        raw_args = raw_args.replace("--force", "").strip()
+
     # Extract --provider <name>
     parts = raw_args.split()
     i = 0
@@ -357,7 +366,7 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool]:
             i += 1
 
     model_input = " ".join(filtered).strip()
-    return (model_input, explicit_provider, is_global, force_refresh, is_session)
+    return (model_input, explicit_provider, is_global, force_refresh, is_session, force_model)
 
 
 def resolve_persist_behavior(is_global: bool, is_session: bool) -> bool:
@@ -676,6 +685,7 @@ def switch_model(
     explicit_provider: str = "",
     user_providers: dict = None,
     custom_providers: list | None = None,
+    force: bool = False,
 ) -> ModelSwitchResult:
     """Core model-switching pipeline shared between CLI and gateway.
 
@@ -710,6 +720,7 @@ def switch_model(
         explicit_provider: From --provider flag (empty = no explicit provider).
         user_providers: The ``providers:`` dict from config.yaml (for user endpoints).
         custom_providers: The ``custom_providers:`` list from config.yaml.
+        force: Whether to bypass provider model-list validation.
 
     Returns:
         ModelSwitchResult with all information the caller needs.
@@ -1050,21 +1061,33 @@ def switch_model(
     new_model = normalize_model_for_provider(new_model, target_provider)
 
     # --- Validate ---
-    try:
-        validation = validate_requested_model(
-            new_model,
-            target_provider,
-            api_key=api_key,
-            base_url=base_url,
-            api_mode=api_mode or None,
-        )
-    except Exception as e:
+    validation: dict[str, Any]
+    if force:
         validation = {
-            "accepted": False,
-            "persist": False,
+            "accepted": True,
+            "persist": True,
             "recognized": False,
-            "message": f"Could not validate `{new_model}`: {e}",
+            "message": (
+                f"Forced model switch: `{new_model}` was accepted without "
+                "checking this provider's model listing."
+            ),
         }
+    else:
+        try:
+            validation = validate_requested_model(
+                new_model,
+                target_provider,
+                api_key=api_key,
+                base_url=base_url,
+                api_mode=api_mode or None,
+            )
+        except Exception as e:
+            validation = {
+                "accepted": False,
+                "persist": False,
+                "recognized": False,
+                "message": f"Could not validate `{new_model}`: {e}",
+            }
 
     # Override rejection if model is in the user's saved provider config.
     # API /v1/models may not list cloud/aliased models even though the server supports them.

@@ -11,7 +11,7 @@ the colon is a variant tag, not a vendor separator.
 import pytest
 from unittest.mock import patch
 
-from hermes_cli.model_switch import switch_model
+from hermes_cli.model_switch import parse_model_flags, switch_model
 
 
 # Shared mock context — skip network calls, credential resolution, catalog lookups
@@ -68,3 +68,60 @@ class TestVariantTagPreservation:
         """Standard vendor/model slugs without tags pass through unchanged."""
         result = _run_switch("anthropic/claude-sonnet-4.6")
         assert result == "anthropic/claude-sonnet-4.6"
+
+
+class TestForceModelSwitch:
+    """Forced switches bypass stale provider model listings only when requested."""
+
+    def test_parse_force_flag_before_or_after_model(self):
+        assert parse_model_flags("--force zai/glm-5.2") == (
+            "zai/glm-5.2",
+            "",
+            False,
+            False,
+            False,
+            True,
+        )
+        assert parse_model_flags("zai/glm-5.2 --force --global") == (
+            "zai/glm-5.2",
+            "",
+            True,
+            False,
+            False,
+            True,
+        )
+
+    def test_force_bypasses_provider_listing_rejection(self):
+        rejected = {
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": "Model `glm-5.2` was not found in this provider's model listing.",
+        }
+
+        with patch("hermes_cli.model_switch.resolve_alias", return_value=None), \
+             patch("hermes_cli.model_switch.list_provider_models", return_value=[]), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value={"api_key": "test", "base_url": "https://api.z.ai/api/paas/v4", "api_mode": "chat_completions"}), \
+             patch("hermes_cli.models.validate_requested_model", return_value=rejected), \
+             patch("hermes_cli.model_switch.get_model_info", return_value=None), \
+             patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
+             patch("hermes_cli.models.detect_provider_for_model", return_value=None):
+            normal = switch_model(
+                raw_input="zai/glm-5.2",
+                current_provider="zai",
+                current_model="glm-5.1",
+            )
+            forced = switch_model(
+                raw_input="zai/glm-5.2",
+                current_provider="zai",
+                current_model="glm-5.1",
+                force=True,
+            )
+
+        assert not normal.success
+        assert "not found in this provider" in normal.error_message
+        assert forced.success
+        assert forced.new_model == "glm-5.2"
+        assert forced.target_provider == "zai"
+        assert "accepted without checking" in forced.warning_message
