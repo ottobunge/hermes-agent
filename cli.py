@@ -7086,6 +7086,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
           /model <name> --global              — switch and persist (explicit)
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+          /model <name> --force               — bypass provider model-list validation
 
         Persistence defaults to on (``model.persist_switch_by_default`` in
         config.yaml, default True). Use ``--session`` for a one-off switch.
@@ -7101,7 +7102,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         parts = cmd_original.split(None, 1)  # split off '/model'
         raw_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Parse --provider, --global, --session, and --refresh flags
+        # Parse --provider, --global, --session, --refresh, and --force flags
         (
             model_input,
             explicit_provider,
