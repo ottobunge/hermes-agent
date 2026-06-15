@@ -8013,6 +8013,7 @@ class HermesCLI:
           /model <name> --global              — switch and persist to config.yaml
           /model <name> --provider <provider> — switch provider + model
           /model --provider <provider>        — switch to provider, auto-detect model
+          /model <name> --force               — bypass provider model-list validation
         """
         from hermes_cli.model_switch import switch_model, parse_model_flags
         from hermes_cli.providers import get_label
@@ -8021,8 +8022,8 @@ class HermesCLI:
         parts = cmd_original.split(None, 1)  # split off '/model'
         raw_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Parse --provider, --global, and --refresh flags
-        model_input, explicit_provider, persist_global, force_refresh = parse_model_flags(raw_args)
+        # Parse --provider, --global, --refresh, and --force flags
+        model_input, explicit_provider, persist_global, force_refresh, force_model = parse_model_flags(raw_args)
 
         # --refresh: wipe the on-disk picker cache before building the
         # provider list. Forces a live re-fetch of every authed provider's
@@ -8095,6 +8096,7 @@ class HermesCLI:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            force=force_model,
         )
 
         if not result.success:
