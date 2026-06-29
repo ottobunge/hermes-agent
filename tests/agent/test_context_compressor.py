@@ -131,6 +131,7 @@ class TestCompress:
                 protect_first_n=1,
                 protect_last_n=2,
                 quiet_mode=True,
+                abort_on_summary_failure=False,
             )
 
         msgs = [
@@ -869,7 +870,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_preserves_tool_paths_and_redacts_secret_context(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         secret = "ghp_" + ("a" * 36)
         msgs = [
@@ -906,7 +913,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_supports_object_tool_calls_and_content_path_mentions(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         tool_call = MagicMock()
         tool_call.id = "call-object"
@@ -938,7 +951,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_preserves_last_dropped_turns_without_tail(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         msgs = [
             {"role": "system", "content": "sys"},
@@ -962,7 +981,13 @@ class TestSummaryFailureTrackingForGatewayWarning:
 
     def test_summary_failure_fallback_is_bounded(self):
         with patch("agent.context_compressor.get_model_context_length", return_value=100000):
-            c = ContextCompressor(model="test", quiet_mode=True, protect_first_n=1, protect_last_n=1)
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=1,
+                abort_on_summary_failure=False,
+            )
 
         long_text = "important detail " * 2000
         msgs = [
