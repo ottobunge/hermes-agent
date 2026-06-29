@@ -331,7 +331,7 @@ def parse_model_flags(raw_args: str) -> tuple[str, str, bool, bool, bool, bool]:
     # Normalize Unicode dashes (Telegram/iOS auto-converts -- to em/en dash)
     # A single Unicode dash before a flag keyword becomes "--"
     import re as _re
-    raw_args = _re.sub(r'[‒–—―](provider|global|session|refresh|force)', r'--', raw_args)
+    raw_args = _re.sub(r'[‒–—―](provider|global|session|refresh|force)', r'--\1', raw_args)
 
     # Extract --global
     if "--global" in raw_args:
