@@ -422,7 +422,7 @@ def _env_ref_name(ref: str) -> str:
 # Security helpers
 # ---------------------------------------------------------------------------
 
-def _build_safe_env(user_env: Optional[dict]) -> dict:
+def _build_safe_env(user_env: Optional[Dict[str, str]]) -> Dict[str, str]:
     """Build a filtered environment dict for stdio subprocesses.
 
     Only passes through safe baseline variables (PATH, HOME, etc.) and XDG_*
@@ -442,6 +442,13 @@ def _build_safe_env(user_env: Optional[dict]) -> dict:
             env[key] = value
     if user_env:
         env.update(user_env)
+    nix_runtime_path = os.environ.get("HERMES_NIX_RUNTIME_PATH")
+    if nix_runtime_path:
+        existing_path = env.get("PATH", "")
+        env["PATH"] = os.pathsep.join(
+            part for part in (nix_runtime_path, existing_path) if part
+        )
+    env.pop("HERMES_NIX_RUNTIME_PATH", None)
     return env
 
 
