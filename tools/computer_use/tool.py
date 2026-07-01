@@ -132,12 +132,26 @@ def _get_backend() -> ComputerUseBackend:
     global _backend
     with _backend_lock:
         if _backend is None:
-            backend_name = os.environ.get("HERMES_COMPUTER_USE_BACKEND", "cua").lower()
+            backend_name = os.environ.get(
+                "HERMES_COMPUTER_USE_BACKEND",
+                # Default to "auto": pick LinuxCliBackend on Linux when
+                # the CLI tools are present, fall back to cua elsewhere.
+                "auto",
+            ).lower()
             if backend_name in {"cua", "cua-driver", ""}:
                 from tools.computer_use.cua_backend import CuaDriverBackend
                 _backend = CuaDriverBackend()
             elif backend_name == "noop":  # pragma: no cover
                 _backend = _NoopBackend()
+            elif backend_name in {"linux", "auto"}:
+                from tools.computer_use.linux_backend import LinuxCliBackend
+                _backend = LinuxCliBackend()
+                if backend_name == "auto" and not _backend.is_available():
+                    # Auto-fallback to cua-driver on systems where the
+                    # Linux CLI toolchain isn't installed (covers macOS
+                    # users during the rollout window).
+                    from tools.computer_use.cua_backend import CuaDriverBackend
+                    _backend = CuaDriverBackend()
             else:
                 raise RuntimeError(f"Unknown HERMES_COMPUTER_USE_BACKEND={backend_name!r}")
             _backend.start()
@@ -810,12 +824,18 @@ def _element_to_dict(e: UIElement) -> Dict[str, Any]:
 def check_computer_use_requirements() -> bool:
     """Return True iff computer_use can run on this host.
 
-    Conditions: macOS + cua-driver binary installed (or override via env).
+    Conditions:
+      macOS  -> cua-driver binary installed (or override via env).
+      Linux  -> ydotool + grim + AT-SPI bus present (LinuxCliBackend).
+      Other  -> False.
     """
-    if sys.platform != "darwin":
-        return False
-    from tools.computer_use.cua_backend import cua_driver_binary_available
-    return cua_driver_binary_available()
+    if sys.platform == "darwin":
+        from tools.computer_use.cua_backend import cua_driver_binary_available
+        return cua_driver_binary_available()
+    if sys.platform.startswith("linux"):
+        from tools.computer_use.linux_backend import LinuxCliBackend
+        return LinuxCliBackend().is_available()
+    return False
 
 
 def get_computer_use_schema() -> Dict[str, Any]:
