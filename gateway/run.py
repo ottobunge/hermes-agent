@@ -19862,6 +19862,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         else:
             _status_thread_metadata = self._thread_metadata_for_source(source, event_message_id) if _progress_thread_id else None
 
+        # Mattermost source threads: route approval text fallback back to
+        # the triggering message so the prompt sits in the same thread as
+        # the command that triggered it.  Other platforms have their own
+        # routing (Feishu uses reply_in_thread via metadata, etc.).
+        _approval_reply_to = (
+            event_message_id
+            if source.platform == Platform.MATTERMOST
+            and source.thread_id
+            and event_message_id
+            else None
+        )
+
         def _status_callback_sync(event_type: str, message: str) -> None:
             if not _status_adapter or not _run_still_current():
                 return
@@ -20704,6 +20716,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         _status_adapter.send(
                             _status_chat_id,
                             msg,
+                            reply_to=_approval_reply_to,
                             metadata=_status_thread_metadata,
                         ),
                         _loop_for_step,

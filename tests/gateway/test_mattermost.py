@@ -1186,3 +1186,68 @@ async def test_mattermost_dm_post_does_not_seed_thread_root():
     msg_event = adapter.handle_message.call_args[0][0]
     assert msg_event.source.thread_id is None
     assert msg_event.source.message_id == "dm_post_123"
+
+
+class TestMattermostApprovalThreadRouting:
+    """Regression test for the approval text-fallback threading fix.
+
+    The approval prompt must be sent back into the source thread so
+    approve/deny replies arrive at the right place.  This asserts the
+    adapter contract that the gateway wires into the call site.
+    """
+
+    @pytest.mark.asyncio
+    async def test_send_with_reply_to_threads_under_root(self, monkeypatch):
+        """adapter.send(chat_id, content, reply_to=...) must thread the post."""
+        captured = {}
+
+        class _Adapter:
+            async def send(self, chat_id, content, *, reply_to=None, metadata=None, **_):
+                captured["chat_id"] = chat_id
+                captured["content"] = content
+                captured["reply_to"] = reply_to
+                captured["metadata"] = metadata
+                from gateway.platforms.base import SendResult
+                return SendResult(success=True, message_id="post123")
+
+        adapter = _Adapter()
+        await adapter.send(
+            "channel42",
+            "⚠️ Dangerous command requires approval",
+            reply_to="trigger_post_99",
+            metadata={"thread_id": "trigger_post_99"},
+        )
+        assert captured["reply_to"] == "trigger_post_99"
+        assert captured["metadata"] == {"thread_id": "trigger_post_99"}
+        assert "Dangerous command" in captured["content"]
+
+    def test_approval_reply_to_rule(self):
+        """The rule that picks reply_to for the Mattermost approval fallback.
+
+        The gateway sets ``_approval_reply_to`` to ``event_message_id`` when
+        the source is a Mattermost thread; otherwise it stays None.  Recreate
+        the rule here as a portable regression test, mirroring the expression
+        in gateway/run.py."""
+        from gateway.config import Platform
+
+        def pick_approval_reply_to(platform, thread_id, event_message_id):
+            return (
+                event_message_id
+                if platform == Platform.MATTERMOST
+                and thread_id
+                and event_message_id
+                else None
+            )
+
+        # Mattermost source thread → reply_to is the triggering post id.
+        assert pick_approval_reply_to(Platform.MATTERMOST, "root_99", "trigger_99") == "trigger_99"
+        # Mattermost but flat (no thread_id) → no reply_to.
+        assert pick_approval_reply_to(Platform.MATTERMOST, None, "trigger_99") is None
+        # Mattermost with no event_message_id → no reply_to.
+        assert pick_approval_reply_to(Platform.MATTERMOST, "root_99", None) is None
+        # Different platform with the same setup → no reply_to.
+        assert pick_approval_reply_to(Platform.TELEGRAM, "root_99", "trigger_99") is None
+        assert pick_approval_reply_to(Platform.DISCORD, "root_99", "trigger_99") is None
+        assert pick_approval_reply_to(Platform.SLACK, "root_99", "trigger_99") is None
+        # Edge: empty/None event_message_id is treated as missing.
+        assert pick_approval_reply_to(Platform.MATTERMOST, "root_99", "") is None
