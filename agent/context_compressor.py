@@ -2750,6 +2750,16 @@ This compaction should PRIORITISE preserving all information related to the focu
         # this, /compress would silently no-op for 30-60s after a failure.
         if force:
             self._clear_compression_failure_cooldown()
+        # Snapshot the pre-prune messages so that any path which is supposed
+        # to abort compression (no-op or summary-failure) can return the
+        # originals unchanged.  _prune_old_tool_results() below reassigns
+        # ``messages`` to a fresh list with old tool outputs replaced by
+        # 1-line summaries; if we returned that on the abort paths we would
+        # silently destroy real tool output even when summary-generation
+        # never ran (Phase 1 only) or never succeeded (Phase 3).  The cheap
+        # shallow copy is safe because messages are dicts and downstream
+        # code treats them as read-only after compress() returns.  (#29559)
+        original_messages = list(messages)
         n_messages = len(messages)
         # Only need head + 3 tail messages minimum (token budget decides the real tail size)
         _min_for_compress = self._protect_head_size(messages) + 3 + 1
@@ -2759,7 +2769,7 @@ This compaction should PRIORITISE preserving all information related to the focu
                     "Cannot compress: only %d messages (need > %d)",
                     n_messages, _min_for_compress,
                 )
-            return messages
+            return original_messages
 
         display_tokens = current_tokens if current_tokens else self.last_prompt_tokens or estimate_messages_tokens_rough(messages)
 
@@ -2794,7 +2804,10 @@ This compaction should PRIORITISE preserving all information related to the focu
                     compress_start, compress_end,
                     self._ineffective_compression_count,
                 )
-            return messages
+            # Return originals to preserve real tool outputs — Phase 1 prune
+            # may have replaced them with 1-line summaries already, and this
+            # is a no-op path that should be invisible to the caller.  (#29559)
+            return original_messages
 
         turns_to_summarize = messages[compress_start:compress_end]
         # A persisted handoff summary can sit in the protected head after a
@@ -2906,7 +2919,11 @@ This compaction should PRIORITISE preserving all information related to the focu
                         "frozen until the next /compress or /new.",
                         n_skipped,
                     )
-            return messages
+            # Return the pre-prune originals so the caller keeps the
+            # real tool outputs intact — Phase 1 (_prune_old_tool_results)
+            # may have already replaced some tool outputs with 1-line
+            # summaries, and abort must not be lossy.  (#29559)
+            return original_messages
 
         # Phase 4: Assemble compressed message list
         compressed = []
