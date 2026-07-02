@@ -99,9 +99,11 @@ class MattermostAdapter(BasePlatformAdapter):
         self._closing = False
 
         # Reply mode: "thread" to nest replies, "off" for flat messages.
+        # Default to threaded replies so channel mentions start a Mattermost
+        # thread rooted at the triggering post instead of posting at channel root.
         self._reply_mode: str = (
             config.extra.get("reply_mode", "")
-            or os.getenv("MATTERMOST_REPLY_MODE", "off")
+            or os.getenv("MATTERMOST_REPLY_MODE", "thread")
         ).lower()
 
         self._last_post_status: Optional[int] = None
