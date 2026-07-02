@@ -336,6 +336,43 @@ class TestMattermostSend:
         assert payload["root_id"] == "root_post"
 
     @pytest.mark.asyncio
+    async def test_send_defaults_to_thread_reply_mode(self):
+        """Mattermost replies should thread by default."""
+        assert self.adapter._reply_mode == "thread"
+
+    @pytest.mark.asyncio
+    async def test_send_uses_metadata_thread_id_as_root(self):
+        """Status/synthetic sends can route by metadata thread_id alone."""
+        self.adapter._reply_mode = "thread"
+
+        mock_resp = AsyncMock()
+        mock_resp.status = 200
+        mock_resp.json = AsyncMock(return_value={"id": "post_from_metadata"})
+        mock_resp.text = AsyncMock(return_value="")
+        mock_resp.__aenter__ = AsyncMock(return_value=mock_resp)
+        mock_resp.__aexit__ = AsyncMock(return_value=False)
+
+        mock_get_resp = AsyncMock()
+        mock_get_resp.status = 200
+        mock_get_resp.json = AsyncMock(return_value={"id": "root_from_meta", "root_id": ""})
+        mock_get_resp.text = AsyncMock(return_value="")
+        mock_get_resp.__aenter__ = AsyncMock(return_value=mock_get_resp)
+        mock_get_resp.__aexit__ = AsyncMock(return_value=False)
+
+        self.adapter._session.post = MagicMock(return_value=mock_resp)
+        self.adapter._session.get = MagicMock(return_value=mock_get_resp)
+
+        result = await self.adapter.send(
+            "channel_1",
+            "Status update",
+            metadata={"thread_id": "root_from_meta"},
+        )
+
+        assert result.success is True
+        payload = self.adapter._session.post.call_args[1]["json"]
+        assert payload["root_id"] == "root_from_meta"
+
+    @pytest.mark.asyncio
     async def test_send_without_thread_no_root_id(self):
         """When reply_mode is 'off', reply_to should NOT set root_id."""
         self.adapter._reply_mode = "off"
@@ -611,6 +648,52 @@ class TestMattermostWebSocketParsing:
         assert self.adapter.handle_message.called
         msg_event = self.adapter.handle_message.call_args[0][0]
         assert msg_event.source.thread_id == "root_post_123"
+
+    @pytest.mark.asyncio
+    async def test_channel_root_post_uses_own_id_as_thread_id(self):
+        """Root channel posts should start a distinct Mattermost thread session."""
+        post_data = {
+            "id": "root_post_456",
+            "user_id": "user_123",
+            "channel_id": "chan_456",
+            "message": "@bot_user_id Start a new thread",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "O",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id == "root_post_456"
+
+    @pytest.mark.asyncio
+    async def test_dm_root_post_keeps_dm_session_unthreaded(self):
+        """DM roots should not create one session per message."""
+        post_data = {
+            "id": "dm_post_123",
+            "user_id": "user_123",
+            "channel_id": "dm_chan",
+            "message": "DM message",
+        }
+        event = {
+            "event": "posted",
+            "data": {
+                "post": json.dumps(post_data),
+                "channel_type": "D",
+                "sender_name": "@alice",
+            },
+        }
+
+        await self.adapter._handle_ws_event(event)
+        assert self.adapter.handle_message.called
+        msg_event = self.adapter.handle_message.call_args[0][0]
+        assert msg_event.source.thread_id is None
 
     @pytest.mark.asyncio
     async def test_invalid_post_json_ignored(self):
