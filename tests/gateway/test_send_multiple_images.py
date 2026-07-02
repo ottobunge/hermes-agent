@@ -358,6 +358,7 @@ class TestMattermostMultiImage:
         a._reply_mode = "thread"
         a._api_post = AsyncMock(return_value={"id": "post123"})
         a._upload_file = AsyncMock(side_effect=lambda *args, **kwargs: f"fid_{a._upload_file.await_count}")
+        a._resolve_root_id = AsyncMock(side_effect=lambda thread_id: f"root-{thread_id}")
         return a
 
     def test_local_files_uploaded_and_single_post(self, adapter, tmp_path):
@@ -391,6 +392,18 @@ class TestMattermostMultiImage:
         assert adapter._api_post.await_count == 2
         sizes = [len(c.args[1]["file_ids"]) for c in adapter._api_post.await_args_list]
         assert sizes == [5, 2]
+
+    def test_thread_metadata_sets_resolved_root_id(self, adapter, tmp_path):
+        """Threaded Mattermost batches resolve metadata.thread_id to a root_id."""
+        p = tmp_path / "img.png"
+        p.write_bytes(b"\x89PNG" + b"\x00" * 20)
+
+        images = [(f"file://{p}", "")]
+        _run(adapter.send_multiple_images("channel123", images, metadata={"thread_id": "reply123"}))
+
+        adapter._resolve_root_id.assert_awaited_once_with("reply123")
+        payload = adapter._api_post.await_args.args[1]
+        assert payload["root_id"] == "root-reply123"
 
     def test_empty_noop(self, adapter):
         _run(adapter.send_multiple_images("channel123", []))
