@@ -3591,6 +3591,58 @@ def test_config_set_model_explicit_provider_skips_broken_default_init(monkeypatc
         server._sessions.pop("sid", None)
 
 
+def test_config_set_model_forwards_force_flag(monkeypatch):
+    """The /config.set model gateway path must forward --force to switch_model()."""
+    class _Agent:
+        provider = "zai"
+        model = "glm-5.1"
+        base_url = "https://api.z.ai/api/paas/v4"
+        api_key = "zai-key"
+
+        def switch_model(self, **_kwargs):
+            return None
+
+    result = types.SimpleNamespace(
+        success=True,
+        new_model="glm-5.2",
+        target_provider="zai",
+        api_key="zai-key",
+        base_url="https://api.z.ai/api/paas/v4",
+        api_mode="chat_completions",
+        warning_message="forced",
+    )
+    seen = {}
+
+    def _switch_model(**kwargs):
+        seen.update(kwargs)
+        return result
+
+    server._sessions["sid"] = _session(agent=_Agent())
+    monkeypatch.setattr("hermes_cli.model_switch.switch_model", _switch_model)
+    monkeypatch.setattr(server, "_restart_slash_worker", lambda sid, session: None)
+    monkeypatch.setattr(server, "_emit", lambda *args, **kwargs: None)
+
+    try:
+        resp = server.handle_request(
+            {
+                "id": "1",
+                "method": "config.set",
+                "params": {
+                    "session_id": "sid",
+                    "key": "model",
+                    "value": "--force zai/glm-5.2",
+                },
+            }
+        )
+
+        assert resp["result"]["value"] == "glm-5.2"
+        assert resp["result"]["warning"] == "forced"
+        assert seen["raw_input"] == "zai/glm-5.2"
+        assert seen["force"] is True
+    finally:
+        server._sessions.pop("sid", None)
+
+
 def test_config_set_model_explicit_provider_surfaces_selected_provider_errors(monkeypatch):
     seen = {"build": 0, "wait": 0}
     session = _session()
