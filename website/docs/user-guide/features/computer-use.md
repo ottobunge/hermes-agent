@@ -196,6 +196,8 @@ reconsider.
 
 ## See also
 
+- [Computer Use (Linux / KDE Plasma)](computer-use-linux.md) — the
+  cross-platform CLI-backed path (AT-SPI + ydotool + grim).
 - [Universal skill: `macos-computer-use`](https://github.com/NousResearch/hermes-agent/blob/main/skills/apple/macos-computer-use/SKILL.md)
 - [cua-driver source (trycua/cua)](https://github.com/trycua/cua)
 - [Browser automation](./browser.md) for cross-platform web tasks.

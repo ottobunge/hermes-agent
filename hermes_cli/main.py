@@ -11996,27 +11996,26 @@ def main():
     build_tools_parser(subparsers, cmd_tools=cmd_tools)
 
     # =========================================================================
-    # computer-use command — manage Computer Use (cua-driver) on macOS
+    # computer-use command — manage Computer Use backends
     # =========================================================================
     computer_use_parser = subparsers.add_parser(
         "computer-use",
-        help="Manage the Computer Use (cua-driver) backend (macOS)",
+        help="Manage the Computer Use backend (macOS + Linux)",
         description=(
-            "Install or check the cua-driver binary used by the\n"
-            "`computer_use` toolset. macOS-only.\n\n"
-            "Use `hermes computer-use install` to fetch and run the\n"
-            "upstream cua-driver installer. This is equivalent to the\n"
-            "post-setup hook that `hermes tools` runs when you first\n"
-            "enable the Computer Use toolset, and is a stable target\n"
-            "for re-running the install if it didn't fire (e.g. when\n"
-            "toggling the toolset on a returning-user setup)."
+            "Check / install the Computer Use backend. On macOS this\n"
+            "manages `cua-driver` (downloaded via `install`). On Linux\n"
+            "the backend uses the host CLI toolchain (ydotool, grim,\n"
+            "wtype, wl-copy, AT-SPI) that the nixos `nativeControl`\n"
+            "flag already wires up — `install` is a no-op there.\n\n"
+            "Use `hermes computer-use status` to see what's installed\n"
+            "on this host, regardless of platform."
         ),
     )
     computer_use_sub = computer_use_parser.add_subparsers(dest="computer_use_action")
 
     computer_use_install = computer_use_sub.add_parser(
         "install",
-        help="Install or repair the cua-driver binary (macOS)",
+        help="Install or repair the cua-driver binary (macOS only — no-op on Linux)",
     )
     computer_use_install.add_argument(
         "--upgrade",
@@ -12029,20 +12028,29 @@ def main():
     )
     computer_use_sub.add_parser(
         "status",
-        help="Print whether cua-driver is installed and on PATH",
+        help="Print which Computer Use backend is available on this host",
     )
 
     def cmd_computer_use(args):
         action = getattr(args, "computer_use_action", None)
         if action == "install":
+            import sys
+            if sys.platform != "darwin":
+                print(
+                    "computer-use install: no-op on this platform.\n"
+                    "Linux hosts use the CLI toolchain (`ydotool`, `grim`,\n"
+                    "`wtype`, AT-SPI). See hosts/thinkpad/configuration.nix\n"
+                    "for the package list, gated by vars.services.hermesLocal.nativeControl."
+                )
+                return
             from hermes_cli.tools_config import install_cua_driver
             install_cua_driver(upgrade=bool(getattr(args, "upgrade", False)))
             return
         if action == "status":
             import shutil
             import subprocess
-            path = shutil.which("cua-driver")
-            if path:
+            cua_path = shutil.which("cua-driver")
+            if cua_path:
                 version = ""
                 try:
                     version = subprocess.run(
@@ -12051,14 +12059,40 @@ def main():
                     ).stdout.strip()
                 except Exception:
                     pass
-                if version:
-                    print(f"cua-driver: installed at {path} ({version})")
-                else:
-                    print(f"cua-driver: installed at {path}")
+                ver_suffix = f" ({version})" if version else ""
+                print(f"cua-driver (macOS): installed at {cua_path}{ver_suffix}")
                 print("  Refresh to latest: hermes computer-use install --upgrade")
                 return
-            print("cua-driver: not installed")
+            print("cua-driver (macOS): not installed")
             print("  Run: hermes computer-use install")
+
+            # Linux backend status
+            import sys
+            if sys.platform.startswith("linux"):
+                from tools.computer_use.linux_backend import (
+                    _YDOTOOL, _GRIM, _WTYPE, _WL_COPY, _GDBUS, _ATSPI_BUS,
+                )
+                missing = [
+                    name for name, path in [
+                        ("ydotool", _YDOTOOL),
+                        ("grim", _GRIM),
+                        ("gdbus (glib)", _GDBUS),
+                    ] if not path
+                ]
+                if missing:
+                    print()
+                    print("LinuxCliBackend: missing tools:", ", ".join(missing))
+                    print("  On NixOS, add to hosts/<host>/configuration.nix:")
+                    print("    ++ lib.optionals hermesNativeControlEnabled (with pkgs; [")
+                    print("      ydotool wtype xdotool wl-clipboard grim slurp ]);")
+                    print("    programs.ydotool = { enable = true; group = \"uinput\"; };")
+                    print("    xdg.portal.enable = true; extraPortals = [ pkgs.xdg-desktop-portal-kde ];")
+                else:
+                    print()
+                    print("LinuxCliBackend: ready (ydotool + grim + gdbus on PATH)")
+                    print(f"  AT-SPI bus: {_ATSPI_BUS}")
+                    print(f"  Optional: wtype={bool(_WTYPE)}, wl-copy={bool(_WL_COPY)}")
+                    print("  Customise with HERMES_COMPUTER_USE_BACKEND=linux|cua")
             return
         # No subcommand → show help
         computer_use_parser.print_help()
