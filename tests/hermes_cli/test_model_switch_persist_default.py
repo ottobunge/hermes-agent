@@ -20,10 +20,10 @@ from hermes_cli.model_switch import parse_model_flags, resolve_persist_behavior
 
 class TestParseModelFlagsSession:
     def test_no_flags(self):
-        assert parse_model_flags("sonnet") == ("sonnet", "", False, False, False)
+        assert parse_model_flags("sonnet") == ("sonnet", "", False, False, False, False)
 
     def test_global_flag(self):
-        assert parse_model_flags("sonnet --global") == ("sonnet", "", True, False, False)
+        assert parse_model_flags("sonnet --global") == ("sonnet", "", True, False, False, False)
 
     def test_session_flag(self):
         assert parse_model_flags("sonnet --session") == (
@@ -32,6 +32,7 @@ class TestParseModelFlagsSession:
             False,
             False,
             True,
+            False,
         )
 
     def test_session_with_provider(self):
@@ -41,10 +42,11 @@ class TestParseModelFlagsSession:
             False,
             False,
             True,
+            False,
         )
 
     def test_refresh_flag_still_parsed(self):
-        assert parse_model_flags("--refresh") == ("", "", False, True, False)
+        assert parse_model_flags("--refresh") == ("", "", False, True, False, False)
 
     def test_unicode_dash_session_normalized(self):
         # Telegram/iOS auto-converts -- to en/em dashes.
@@ -54,6 +56,7 @@ class TestParseModelFlagsSession:
             False,
             False,
             True,
+            False,
         )
 
 

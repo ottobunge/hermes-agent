@@ -2678,7 +2678,7 @@ def _apply_model_switch(
     *,
     confirm_expensive_model: bool = False,
     pin_session_override: bool = True,
-    parsed_flags: tuple[str, str, bool, bool, bool] | None = None,
+    parsed_flags: tuple[str, str, bool, bool, bool, bool] | None = None,
     persist_override: bool | None = None,
 ) -> dict:
     from hermes_cli.model_switch import (
@@ -2696,6 +2696,7 @@ def _apply_model_switch(
         is_global_flag,
         _force_refresh,
         is_session,
+        force_model,
     ) = parsed_flags
     persist_global = (
         persist_override
@@ -2754,6 +2755,7 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        force=force_model,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")
@@ -9905,7 +9907,7 @@ def _(rid, params: dict) -> dict:
                 from hermes_cli.model_switch import parse_model_flags
 
                 parsed_flags = parse_model_flags(value)
-                _model_input, explicit_provider, _persist_global, _force_refresh, _is_session = parsed_flags
+                _model_input, explicit_provider, _persist_global, _force_refresh, _is_session, _force_model = parsed_flags
                 if session.get("agent") is None and not explicit_provider.strip():
                     session_id = params.get("session_id", "")
                     _start_agent_build(session_id, session)

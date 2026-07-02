@@ -7967,13 +7967,14 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
         parts = cmd_original.split(None, 1)  # split off '/model'
         raw_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Parse --provider, --global, --session, and --refresh flags
+        # Parse --provider, --global, --session, --refresh, and --force flags
         (
             model_input,
             explicit_provider,
             is_global_flag,
             force_refresh,
             is_session,
+            force_model,
         ) = parse_model_flags(raw_args)
         # Resolve the effective persistence once: --session overrides the
         # config-gated default, --global forces persist, otherwise defer to
@@ -8053,6 +8054,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            force=force_model,
         )
 
         if not result.success:
