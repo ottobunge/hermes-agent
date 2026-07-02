@@ -1485,6 +1485,60 @@ class TestAbortOnSummaryFailure:
         assert c._summary_failure_cooldown_until == 0.0
         assert len(result) < len(msgs)
 
+    def test_abort_returns_originals_after_prune(self):
+        """When Phase 1 has already pruned old tool results and the LLM
+        summary call fails, compress() must return the originals unchanged
+        so callers keep their real tool outputs.  (#29559)"""
+        # Build a large enough message list for Phase 1 prune to actually
+        # run and replace some tool outputs with summaries.
+        msgs = [
+            {"role": "system", "content": "sys"},
+            {"role": "user", "content": "msg 1"},
+            {"role": "assistant", "content": None, "tool_calls": [{"id": "c1", "function": {"name": "terminal", "arguments": "{}"}}]},
+            {"role": "tool", "tool_call_id": "c1", "content": "REAL TOOL OUTPUT KEEP ME"},
+            {"role": "assistant", "content": "msg 2"},
+            {"role": "user", "content": "msg 3"},
+            {"role": "assistant", "content": "msg 4"},
+            {"role": "user", "content": "msg 5"},
+            {"role": "assistant", "content": "msg 6"},
+            {"role": "user", "content": "msg 7"},
+            {"role": "assistant", "content": "msg 8"},
+            {"role": "user", "content": "msg 9"},
+        ]
+        # Snapshot the originals.
+        pre_prune_tool_idx = next(
+            i for i, m in enumerate(msgs)
+            if m.get("role") == "tool"
+            and m.get("content") == "REAL TOOL OUTPUT KEEP ME"
+        )
+
+        with patch("agent.context_compressor.get_model_context_length", return_value=100000):
+            c = ContextCompressor(
+                model="test",
+                quiet_mode=True,
+                protect_first_n=1,
+                protect_last_n=2,
+                abort_on_summary_failure=True,
+            )
+
+        # Force Phase 1 to actually prune something — set protect_tail_count
+        # to 1 so a tool result in the middle of the transcript lands in
+        # the prune window.
+        c.protect_last_n = 1
+
+        # LLM summary raises -> abort path.
+        with patch("agent.context_compressor.call_llm", side_effect=Exception("boom")):
+            result = c.compress(msgs)
+
+        assert c._last_compress_aborted is True
+        # Find the tool message in the returned list — must still hold the
+        # real content.
+        tool_msgs = [m for m in result if m.get("role") == "tool"]
+        assert tool_msgs, "expected the tool message to still be present"
+        assert any(
+            m.get("content") == "REAL TOOL OUTPUT KEEP ME"
+            for m in tool_msgs
+        ), "Phase 1 prune must not leak into the abort return value"
     def test_force_true_bypasses_persisted_session_cooldown(self, tmp_path):
         mock_response = MagicMock()
         mock_response.choices = [MagicMock()]
