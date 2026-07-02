@@ -11,7 +11,7 @@ the colon is a variant tag, not a vendor separator.
 import pytest
 from unittest.mock import patch
 
-from hermes_cli.model_switch import switch_model
+from hermes_cli.model_switch import parse_model_flags, switch_model
 
 
 # Shared mock context — skip network calls, credential resolution, catalog lookups
@@ -68,3 +68,62 @@ class TestVariantTagPreservation:
         """Standard vendor/model slugs without tags pass through unchanged."""
         result = _run_switch("anthropic/claude-sonnet-4.6")
         assert result == "anthropic/claude-sonnet-4.6"
+
+
+class TestForceModelSwitch:
+    """Forced switches bypass stale provider model listings only when requested."""
+
+    def test_parse_force_flag_before_or_after_model(self):
+        assert parse_model_flags("--force zai/glm-5.2") == (
+            "zai/glm-5.2",
+            "",
+            False,
+            False,
+            False,
+            True,
+        )
+        assert parse_model_flags("zai/glm-5.2 --force --global") == (
+            "zai/glm-5.2",
+            "",
+            True,
+            False,
+            False,
+            True,
+        )
+
+    def test_force_bypasses_provider_listing_rejection(self):
+        rejected = {
+            "accepted": False,
+            "persist": False,
+            "recognized": False,
+            "message": "Model `glm-5.2` was not found in this provider's model listing.",
+        }
+
+        with patch("hermes_cli.model_switch.resolve_alias", return_value=None), \
+             patch("hermes_cli.model_switch.list_provider_models", return_value=[]), \
+             patch("hermes_cli.runtime_provider.resolve_runtime_provider",
+                   return_value={"api_key": "test", "base_url": "https://openrouter.ai/api/v1", "api_mode": "chat_completions"}), \
+             patch("hermes_cli.models.validate_requested_model", return_value=rejected), \
+             patch("hermes_cli.model_switch.get_model_info", return_value=None), \
+             patch("hermes_cli.model_switch.get_model_capabilities", return_value=None), \
+             patch("hermes_cli.models.detect_provider_for_model", return_value=None):
+            # Without --force, the rejected validation propagates.
+            result_no_force = switch_model(
+                raw_input="unknown/some-hidden-model",
+                current_provider="openrouter",
+                current_model="anthropic/claude-sonnet-4.6",
+                force=False,
+            )
+            assert not result_no_force.success
+            assert "not found" in (result_no_force.warning_message or result_no_force.error_message or "")
+
+            # With --force, validation is skipped and the model is accepted.
+            result_force = switch_model(
+                raw_input="unknown/some-hidden-model",
+                current_provider="openrouter",
+                current_model="anthropic/claude-sonnet-4.6",
+                force=True,
+            )
+            assert result_force.success, f"forced switch should bypass validation: {result_force.error_message}"
+            assert result_force.new_model == "unknown/some-hidden-model"
+            assert "Forced model switch" in (result_force.warning_message or "")

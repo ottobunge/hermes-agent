@@ -1398,6 +1398,7 @@ class GatewaySlashCommandsMixin:
             is_global_flag,
             force_refresh,
             is_session,
+            force_model,
         ) = parse_model_flags(raw_args)
         persist_global = resolve_persist_behavior(is_global_flag, is_session)
 
@@ -1508,6 +1509,7 @@ class GatewaySlashCommandsMixin:
                             explicit_provider=provider_slug,
                             user_providers=user_provs,
                             custom_providers=custom_provs,
+                            force=force_model,
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
@@ -1737,6 +1739,7 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            force=force_model,
         )
 
         if not result.success:
