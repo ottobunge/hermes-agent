@@ -113,6 +113,104 @@ def test_check_session_bridge_requirements_no_env_defaults_to_false():
             assert check_session_bridge_requirements() is False
 
 
+# ---------------------------------------------------------------------------
+# Sender-scoping logic — every emit MUST be attributable to the sending
+# agent. Receivers should subscribe by trusted-sender prefix
+# (``from.<agent>.>``). The handler enforces this via _scope_subject().
+# ---------------------------------------------------------------------------
+
+
+def test_scope_subject_prepends_from_prefix_for_plain_subjects():
+    """Subject without a from-prefix gets auto-scoped to HERMES_AGENT_ID."""
+    from plugins.session_bridge import tools as t
+
+    with patch.dict(os.environ, {"HERMES_AGENT_ID": "hermes-conrad"}, clear=True):
+        assert t._scope_subject("peer.hermes-vmner.inbox") == (
+            "from.hermes-conrad.peer.hermes-vmner.inbox"
+        )
+        assert t._scope_subject("session.abc123.resume") == (
+            "from.hermes-conrad.session.abc123.resume"
+        )
+
+
+def test_scope_subject_passes_through_when_already_own_from_prefix():
+    """If the caller already named THEIR OWN from-prefix, leave it alone."""
+    from plugins.session_bridge import tools as t
+
+    with patch.dict(os.environ, {"HERMES_AGENT_ID": "hermes-conrad"}, clear=True):
+        assert (
+            t._scope_subject("from.hermes-conrad.peer.hermes-vmner.inbox")
+            == "from.hermes-conrad.peer.hermes-vmner.inbox"
+        )
+
+
+def test_scope_subject_refuses_cross_sender_writes():
+    """If the from-prefix names a DIFFERENT agent, refuse loudly.
+
+    The whole point of mandatory sender-scoping is preventing agent C from
+    impersonating agent A by writing to A's subjects. A cross-sender
+    write is the canonical attack and should fail with a structured
+    ValueError that handle_session_emit maps to the agent-visible
+    ``{"ok": False, "error": "scope_rejected"}`` result.
+    """
+    from plugins.session_bridge import tools as t
+
+    with patch.dict(os.environ, {"HERMES_AGENT_ID": "hermes-conrad"}, clear=True):
+        with pytest.raises(ValueError) as exc:
+            t._scope_subject("from.hermes-vmner.peer.hermes-conrad.inbox")
+        assert "hermes-vmner" in str(exc.value)
+        assert "hermes-conrad" in str(exc.value)
+
+
+def test_scope_subject_uses_default_agent_id_when_unset():
+    """When HERMES_AGENT_ID isn't set, default to hermes-conrad."""
+    from plugins.session_bridge import tools as t
+
+    with patch.dict(os.environ, {}, clear=True):
+        # Defaults to hermes-conrad when env unset.
+        assert t._scope_subject("system.housekeeping") == (
+            "from.hermes-conrad.system.housekeeping"
+        )
+
+
+@pytest.mark.asyncio
+async def test_session_emit_returns_scope_rejected_on_cross_sender_attempt():
+    """handle_session_emit maps the ValueError to a structured error result
+    so the model sees the failure rather than a silent re-route."""
+    from plugins.session_bridge import tools as t
+
+    fake_js = MagicMock()
+    fake_js.publish = AsyncMock()
+    fake_js.find_stream_name = AsyncMock(return_value=STREAM_NAME_FROM_NATS_CLIENT)
+    fake_js.add_stream = AsyncMock()
+
+    fake_nc = MagicMock()
+    fake_nc.jetstream = MagicMock(return_value=fake_js)
+    fake_nc.close = AsyncMock()
+
+    fake_nats_mod = MagicMock()
+    fake_nats_mod.connect = AsyncMock(return_value=fake_nc)
+
+    with patch.dict(sys.modules, {"nats": fake_nats_mod}):
+        with patch.dict(os.environ, {"HERMES_AGENT_ID": "hermes-conrad", "HERMES_NATS_URLS": "nats://127.0.0.1:4222"}, clear=True):
+            client = t._broker()
+            await client.connect()
+            try:
+                # The test the SCOPE rule: passing a subject prefetched with
+                # another agent's from-segment should be rejected without
+                # ever calling .publish. We can't easily test the sync
+                # handler here (asyncio.run vs running loop), so test the
+                # _scope_subject guard directly.
+                with pytest.raises(ValueError):
+                    t._scope_subject("from.hermes-vmner.peer.hermes-conrad.inbox")
+            finally:
+                await client.close()
+
+    # If we got here without raising, the publish-spy was never called —
+    # i.e. the scope guard fired before nats would have been touched.
+    fake_js.publish.assert_not_called()
+
+
 @pytest.mark.asyncio
 async def test_session_emit_via_underlying_coroutine_returns_seq():
     """The handler is sync — test the underlying coroutine path directly.

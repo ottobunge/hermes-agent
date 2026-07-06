@@ -6,17 +6,31 @@ agent-to-agent coordination that MUST NOT surface on user-visible channels
 (see the two-layer architecture rule in MEMORY.md — Raft for human-readable
 agent chat, a separate bus for typed internal coordination).
 
-Subject conventions (publishers and subscribers choose):
+Subject conventions (publishers MUST prefix every subject with
+``from.<agent_id>.``, receivers MUST subscribe with the prefix they trust):
 
-  - ``peer.<agent_id>.inbox``       — point-to-point inbox. Subscribe with
-                                      session_observe to a single agent's
-                                      inbox; emit sends to that agent's
-                                      inbox when invoked with target
-                                      ``peer:<agent_id>:inbox``.
-  - ``session.<session_id>.<verb>`` — one-shot signals for a specific
-                                      session (e.g. ``session.abc123.resume``).
-  - ``system.<topic>``              — broadcast topic all session-bridge
-                                      agents subscribe to (e.g. ``system.housekeeping``).
+  - ``from.<agent_id>.peer.<peer_id>.inbox``        — point-to-point inbox
+                                                    from <agent_id> to
+                                                    <peer_id>. Receiving
+                                                    agent subscribes to
+                                                    ``from.<trusted>.peer.<self>.inbox``
+                                                    to hear only the
+                                                    senders it trusts.
+  - ``from.<agent_id>.session.<session_id>.<verb>`` — per-sender one-shot
+                                                    signals for a specific
+                                                    session.
+  - ``from.<agent_id>.system.<topic>``             — broadcast topics
+                                                    attributed to a
+                                                    single sender.
+
+Every subject published via ``session_emit`` is auto-prefixed with
+``from.<HERMES_AGENT_ID>.``. Receivers that listen via ``session_observe``
+should also subscribe to ``from.<specific-agent>.>`` (no wildcards
+across senders) when they want a single-sender stream — this is the
+fan-in isolation rule that prevents agent C from impersonating agent A
+by writing to A's subjects. v1 implements sender-prefixing in
+``handle_session_emit``; the receive side just observes whatever
+subject the caller names (callers pick the from-prefix they trust).
 
 Latency / durability model:
   - JetStream with a per-tool durable consumer (ack semantics) so messages
