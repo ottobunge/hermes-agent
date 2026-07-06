@@ -48,9 +48,15 @@ class FakeGateway:
     def __init__(self, entries=None):
         self.session_store = FakeSessionStore(entries)
         self.enqueued: List[Any] = []
+        self.notifications: List[Any] = []
+        self._gateway_loop = None
 
     def enqueue_internal_session_event(self, session_key, event):
         self.enqueued.append((session_key, event))
+        return True
+
+    async def publish_internal_notification(self, session_key, text, kind="info"):
+        self.notifications.append((session_key, text, kind))
         return True
 
 
@@ -162,6 +168,25 @@ class StartStop(unittest.TestCase):
 
         asyncio.run(_go())
 
+    def test_start_wires_notification_publisher_into_dispatcher(self):
+        runtime = SessionRoutingRuntime()
+        gateway = FakeGateway()
+
+        async def _go():
+            p1, p2, p3 = self._patches()
+            with p1, p2, p3:
+                await runtime.on_gateway_start(gateway=gateway)
+                dispatcher = FakeInboxRunner.instances[0].kwargs[
+                    "on_message"
+                ].__self__
+                self.assertEqual(
+                    dispatcher._publish_notification,
+                    runtime._publish_notification,
+                )
+                await runtime.on_gateway_stop()
+
+        asyncio.run(_go())
+
     def test_start_skipped_without_broker_env(self):
         runtime = SessionRoutingRuntime()
         gateway = FakeGateway()
@@ -220,6 +245,112 @@ class Collaborators(unittest.TestCase):
         runtime = SessionRoutingRuntime()
         runtime._gateway = ExplodingGateway()
         self.assertFalse(runtime._enqueue_event("sk-1", object()))
+
+    def test_publish_notification_delegates_to_gateway(self):
+        runtime = SessionRoutingRuntime()
+        gateway = FakeGateway()
+        runtime._gateway = gateway
+        asyncio.run(runtime._publish_notification("sk-1", "hello", "lifecycle"))
+        self.assertEqual(gateway.notifications, [("sk-1", "hello", "lifecycle")])
+
+    def test_publish_notification_missing_gateway_method_is_noop(self):
+        class LegacyGateway:  # duck-typed gateway without the new seam
+            pass
+
+        runtime = SessionRoutingRuntime()
+        runtime._gateway = LegacyGateway()
+        asyncio.run(
+            runtime._publish_notification("sk-1", "hello", "lifecycle")
+        )  # must not raise
+
+    def test_publish_notification_swallows_gateway_errors(self):
+        class ExplodingGateway:
+            async def publish_internal_notification(self, sk, text, kind="info"):
+                raise RuntimeError("platform on fire")
+
+        runtime = SessionRoutingRuntime()
+        runtime._gateway = ExplodingGateway()
+        asyncio.run(
+            runtime._publish_notification("sk-1", "hello", "lifecycle")
+        )  # must not raise
+
+
+class ThreadsafeNotification(unittest.TestCase):
+    """publish_notification_threadsafe — sync tool handlers → gateway loop.
+
+    Tool handlers run in a sync context (their own asyncio.run loop);
+    the notification must land on the GATEWAY's loop, fire-and-forget.
+    """
+
+    def test_schedules_on_gateway_loop_from_foreign_thread(self):
+        import threading
+
+        from plugins.session_routing.runtime import (
+            publish_notification_threadsafe,
+        )
+
+        loop = asyncio.new_event_loop()
+        thread = threading.Thread(target=loop.run_forever, daemon=True)
+        thread.start()
+        try:
+            delivered = threading.Event()
+            gateway = FakeGateway()
+            gateway._gateway_loop = loop
+
+            original = gateway.publish_internal_notification
+
+            async def _record(session_key, text, kind="info"):
+                await original(session_key, text, kind=kind)
+                delivered.set()
+
+            gateway.publish_internal_notification = _record
+
+            ok = publish_notification_threadsafe(
+                "sk-1", "↗ back-channel to peer\nhi", "back_channel_out",
+                gateway=gateway,
+            )
+            self.assertTrue(ok)
+            self.assertTrue(delivered.wait(timeout=5.0))
+            self.assertEqual(
+                gateway.notifications,
+                [("sk-1", "↗ back-channel to peer\nhi", "back_channel_out")],
+            )
+        finally:
+            loop.call_soon_threadsafe(loop.stop)
+            thread.join(timeout=5.0)
+            loop.close()
+
+    def test_no_gateway_returns_false(self):
+        from plugins.session_routing import runtime as runtime_mod
+
+        with patch.object(runtime_mod.runtime, "_gateway", None):
+            self.assertFalse(
+                runtime_mod.publish_notification_threadsafe("sk", "t", "info")
+            )
+
+    def test_gateway_without_seam_returns_false(self):
+        from plugins.session_routing.runtime import (
+            publish_notification_threadsafe,
+        )
+
+        class LegacyGateway:
+            _gateway_loop = None
+
+        self.assertFalse(
+            publish_notification_threadsafe(
+                "sk", "t", "info", gateway=LegacyGateway()
+            )
+        )
+
+    def test_gateway_without_loop_returns_false(self):
+        from plugins.session_routing.runtime import (
+            publish_notification_threadsafe,
+        )
+
+        gateway = FakeGateway()  # _gateway_loop is None
+        self.assertFalse(
+            publish_notification_threadsafe("sk", "t", "info", gateway=gateway)
+        )
 
 
 class SessionFinalize(unittest.TestCase):

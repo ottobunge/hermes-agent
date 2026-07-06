@@ -3282,10 +3282,50 @@ class BasePlatformAdapter(ABC):
             metadata=metadata,
         )
 
+    async def publish_system_notification(
+        self,
+        session_key: str,
+        text: str,
+        kind: str = "info",  # "info" | "back_channel_in" | "back_channel_out" | "lifecycle"
+        source: Optional["SessionSource"] = None,
+    ) -> None:
+        """Publish a system notification visible on the platform but NOT in
+        session history.
+
+        Published by gateway code (via
+        ``GatewayRunner.publish_internal_notification``), never by the
+        agent's prompt — e.g. the session-routing plugin mirroring raw
+        back-channel traffic into the user's chat. ``send()`` is pure
+        platform delivery (the same path cron notices use), so the
+        notification never becomes a session turn.
+
+        ``source`` is the session's recorded origin; the default routes
+        to its chat/thread. Without a routable origin this degrades to a
+        log line. Adapters may override for platform-native rendering
+        (ephemeral messages, cards, ...). Never raises.
+        """
+        logger.info(
+            "system_notification[%s] session=%s: %s", kind, session_key, text
+        )
+        chat_id = getattr(source, "chat_id", None)
+        if not chat_id:
+            return
+        try:
+            await self.send(
+                chat_id,
+                text,
+                metadata=_thread_metadata_for_source(source),
+            )
+        except Exception as e:
+            logger.warning(
+                "system_notification[%s] delivery failed for %s: %s",
+                kind, session_key, e,
+            )
+
     async def send_typing(self, chat_id: str, metadata=None) -> None:
         """
         Send a typing indicator.
-        
+
         Override in subclasses if the platform supports it.
         metadata: optional dict with platform-specific context (e.g. thread_id for Slack).
         """
