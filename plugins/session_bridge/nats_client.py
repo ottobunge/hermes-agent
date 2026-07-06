@@ -104,15 +104,19 @@ class NATSClient:
             self._js = self._nc.jetstream()
 
             # Provision the SESSIONS stream. Idempotent: info() will find
-            # an existing stream by name and we skip create. We capture
-            # only the subjects we use today (Phase 2 may widen).
+            # an existing stream by name and we skip create. Capture
+            # every ``from.<agent>.>`` subject — the sender-scoping prefix
+            # is enforced in handle_session_emit() (see _scope_subject()),
+            # so the broker never sees anything NOT under ``from.``. Wild
+            # card covers all sender/verb combinations uniformly; if Phase
+            # 2 introduces non-scoped subjects, narrow the filter set then.
             try:
                 await self._js.find_stream_name(STREAM_NAME)
                 # Stream exists — done.
             except Exception:  # noqa: BLE001 — nats-py raises on not-found
                 await self._js.add_stream(
                     name=STREAM_NAME,
-                    subjects=["peer.*", "session.*", "system.*"],
+                    subjects=["from.>"],
                     # Reasonable defaults; tune in Phase 2.
                     max_msgs=10_000,
                     max_age=24 * 60 * 60,  # 1 day retention
