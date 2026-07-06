@@ -108,6 +108,20 @@ class SessionRoutingRuntime:
             )
             return
 
+        # The plugin's check_fn may have cached a False result during the
+        # window before the broker was reachable (env-set race / VPN not
+        # up at startup). Now that we know the broker works (we just
+        # created the inbox consumer), invalidate the cache so the model
+        # tools become visible on the next turn instead of staying hidden
+        # for the full check_fn TTL.
+        try:
+            from tools.registry import invalidate_check_fn_cache
+            invalidate_check_fn_cache()
+        except Exception as e:  # noqa: BLE001
+            logger.debug(
+                "session_routing runtime: invalidate_check_fn_cache failed: %s", e
+            )
+
         dispatcher = BackChannelDispatcher(
             servers=self._servers,
             my_gateway_id=self._gateway_id,
