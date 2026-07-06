@@ -15,7 +15,7 @@ from plugins.session_routing.address import (
     parse,
     resolve_gateway_id,
     resolve_session_key,
-    subject_allow_pattern,
+    subject_filter_for,
 )
 
 
@@ -75,23 +75,34 @@ class ParseAndBuild(unittest.TestCase):
 
 class EncodeSubject(unittest.TestCase):
     def test_encode_deliver(self):
-        addr = "gw-thinkpad/agent:main:telegram:dm:189562939:39702"
-        subj = encode_subject(addr, verb="deliver")
-        self.assertEqual(subj, "from.gw-thinkpad.agent:main:telegram:dm:189562939:39702.deliver")
+        # New signature: encode_subject(sender_gw, session_key, verb)
+        subj = encode_subject(
+            sender_gateway_id="gw-sender",
+            session_key="agent:main:telegram:dm:189562939:39702",
+            verb="deliver",
+        )
+        self.assertEqual(
+            subj,
+            "from.gw-sender.agent:main:telegram:dm:189562939:39702.deliver",
+        )
 
     def test_decode_roundtrip(self):
-        addr = "gw-thinkpad/agent:main:telegram:dm:189562939:39702"
-        subj = encode_subject(addr, verb="deliver")
-        gw, sk = decode_subject(subj)
-        self.assertEqual((gw, sk), parse(addr))
+        sender_gw = "gw-sender"
+        sk = "agent:main:telegram:dm:189562939:39702"
+        subj = encode_subject(sender_gw, sk, verb="deliver")
+        # decode_subject returns (sender_gw, recipient_session_key)
+        out_sender, out_sk = decode_subject(subj)
+        self.assertEqual(out_sender, sender_gw)
+        self.assertEqual(out_sk, sk)
 
-    def test_decode_rejects_non_deliver(self):
+    def test_decode_rejects_non_deliver_or_malformed(self):
         for bad in [
-            "system.foo",
-            "from.gw-thinkpad.system.foo",   # verb != deliver
-            "from.gw-thinkpad.deliver",      # missing session_key segment
+            "system.foo",                 # not from.<gateway>
+            "from.gw-thinkpad.deliver",   # missing session_key segment
             "prefix.from.gw-thinkpad.x.deliver",  # leading segment
-            "",
+            "",                           # empty
+            "from..x.deliver",            # empty sender_gateway_id
+            "from..deliver",              # only empty parts
         ]:
             with self.subTest(bad=bad):
                 with self.assertRaises(AddressError):
@@ -99,26 +110,28 @@ class EncodeSubject(unittest.TestCase):
 
     def test_verb_rejects_dot(self):
         with self.assertRaises(AddressError):
-            encode_subject("gw/a", verb="two.parts")
+            encode_subject("gw-a", "session", verb="two.parts")
 
     def test_forbidden_chars_rejected(self):
         for bad in [
-            "gw-think*pad/x",          # * in gateway_id
-            "gw-thinkpad/x*y",         # * in session_key
-            "gw-thinkpad/x>",          # > in session_key
-            ">gw-thinkpad/x",          # > in gateway_id
+            "gw-think*pad",        # * in sender_gw
+            "foo*bar",             # * in session_key
+            "x>y",                 # > in session_key
+            ">gw",                 # > in sender_gw
         ]:
             with self.subTest(bad=bad):
                 with self.assertRaises(AddressError):
-                    parse(bad)
+                    encode_subject(sender_gateway_id=bad.split("/")[0] if "/" in bad else bad[:5],
+                                   session_key=bad,
+                                   verb="deliver")
         # Same via build()
         with self.assertRaises(AddressError):
             build("gw*", "session")
         with self.assertRaises(AddressError):
             build("gw", "session>with-arrow")
 
-    def test_allow_pattern(self):
-        self.assertEqual(subject_allow_pattern("gw-thinkpad"), "from.gw-thinkpad.>")
+    def test_subject_filter_for(self):
+        self.assertEqual(subject_filter_for("gw-thinkpad"), "from.gw-thinkpad.>")
 
 
 class Resolve(unittest.TestCase):
