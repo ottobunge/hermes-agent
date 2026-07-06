@@ -8003,6 +8003,65 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             pass
         return True
 
+    async def publish_internal_notification(
+        self,
+        session_key: str,
+        text: str,
+        kind: str = "info",
+    ) -> bool:
+        """Publish a user-visible system notification on a session's platform.
+
+        Plugin-side hook mirroring :meth:`enqueue_internal_session_event`,
+        but for the DISPLAY side-channel instead of session history: the
+        text is delivered by ``adapter.publish_system_notification``
+        (pure platform send) and never becomes a session turn — the
+        agent doesn't see it, prompt caching and role alternation are
+        untouched. Used by the session-routing plugin to mirror raw
+        back-channel traffic and lifecycle events into the user's chat.
+
+        Resolves the adapter through the session store so plugins never
+        touch adapters directly. Returns True when the notification was
+        handed to an adapter, False otherwise (logged, never raises).
+        """
+        try:
+            entry = self.session_store.get_entry(session_key)
+        except Exception as e:
+            logger.warning(
+                "publish_internal_notification: session lookup failed for %s: %s",
+                session_key, e,
+            )
+            return False
+        if entry is None:
+            logger.info(
+                "publish_internal_notification: unknown session_key %s — dropping",
+                session_key,
+            )
+            return False
+
+        origin = entry.origin
+        platform = entry.platform or (origin.platform if origin else None)
+        adapter = self.adapters.get(platform) if platform else None
+        if adapter is None:
+            logger.info(
+                "publish_internal_notification: no adapter for platform %s "
+                "(session %s) — dropping",
+                platform, session_key,
+            )
+            return False
+
+        publish = getattr(adapter, "publish_system_notification", None)
+        if publish is None:
+            return False
+        try:
+            await publish(session_key, text, kind=kind, source=origin)
+        except Exception as e:
+            logger.warning(
+                "publish_internal_notification: adapter publish failed for "
+                "%s: %s", session_key, e,
+            )
+            return False
+        return True
+
     async def stop(
         self,
         *,

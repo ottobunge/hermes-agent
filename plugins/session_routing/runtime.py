@@ -113,6 +113,7 @@ class SessionRoutingRuntime:
             my_gateway_id=self._gateway_id,
             resolve_session_id=self._resolve_session_id,
             enqueue_event=self._enqueue_event,
+            publish_notification=self._publish_notification,
         )
         self._runner = InboxRunner(
             servers=self._servers,
@@ -224,6 +225,32 @@ class SessionRoutingRuntime:
             )
             return False
 
+    async def _publish_notification(
+        self, session_key: str, text: str, kind: str
+    ) -> None:
+        """Dispatcher collaborator: user-visible platform notification.
+
+        Delegates to the gateway's ``publish_internal_notification``
+        seam (display side-channel — never a session turn). Duck-typed
+        and best-effort: a gateway without the seam or a failing
+        platform is logged, never raised — visibility must not affect
+        envelope handling.
+        """
+        publish = getattr(self._gateway, "publish_internal_notification", None)
+        if publish is None:
+            logger.debug(
+                "session_routing runtime: gateway has no "
+                "publish_internal_notification — notification dropped"
+            )
+            return
+        try:
+            await publish(session_key, text, kind=kind)
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "session_routing runtime: notification publish failed "
+                "for %s: %s", session_key, e,
+            )
+
     def _live_session_keys(self) -> List[str]:
         try:
             return [
@@ -278,3 +305,41 @@ class SessionRoutingRuntime:
 
 # Module-level singleton the register() wiring + tests share.
 runtime = SessionRoutingRuntime()
+
+
+def publish_notification_threadsafe(
+    session_key: str,
+    text: str,
+    kind: str = "info",
+    gateway: Any = None,
+) -> bool:
+    """Publish a user-visible notification from OUTSIDE the gateway loop.
+
+    Tool handlers run sync inside their own ``asyncio.run`` loop, so
+    they cannot await the gateway's ``publish_internal_notification``
+    directly — this schedules it on the gateway's loop
+    (``_gateway_loop``, set by GatewayRunner at startup) fire-and-forget.
+
+    ``gateway`` defaults to the runtime singleton's wired gateway.
+    Returns True when the notification was scheduled; False when there
+    is no gateway / seam / loop to schedule on (CLI runs, legacy
+    gateways) — callers treat that as "platform side-channel off".
+    """
+    gw = gateway if gateway is not None else runtime._gateway
+    if gw is None:
+        return False
+    publish = getattr(gw, "publish_internal_notification", None)
+    loop = getattr(gw, "_gateway_loop", None)
+    if publish is None or loop is None:
+        return False
+    try:
+        asyncio.run_coroutine_threadsafe(
+            publish(session_key, text, kind=kind), loop
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.warning(
+            "session_routing runtime: threadsafe notification for %s "
+            "failed to schedule: %s", session_key, e,
+        )
+        return False
+    return True

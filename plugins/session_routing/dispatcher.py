@@ -39,6 +39,7 @@ forever.
 
 from __future__ import annotations
 
+import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
@@ -72,6 +73,13 @@ class BackChannelDispatcher:
           Local session_key → session_id (None = session unknown here).
       enqueue_event(session_key, event) -> bool
           The gateway's ``enqueue_internal_session_event`` seam.
+      publish_notification(session_key, text, kind) -> awaitable | None
+          The gateway's ``publish_internal_notification`` seam: a
+          USER-visible system notification on the session's platform
+          (never a session turn). Optional — None means the platform
+          side-channel is off (bare/legacy wiring) and dispatch runs
+          exactly as before. Failures are swallowed: visibility must
+          never affect envelope handling.
     """
 
     def __init__(
@@ -81,12 +89,14 @@ class BackChannelDispatcher:
         my_gateway_id: str,
         resolve_session_id: Callable[[str], Optional[str]],
         enqueue_event: Callable[[str, Any], bool],
+        publish_notification: Optional[Callable[[str, str, str], Any]] = None,
         capabilities: Optional[List[str]] = None,
     ) -> None:
         self._servers = servers
         self._my_gateway_id = my_gateway_id
         self._resolve_session_id = resolve_session_id
         self._enqueue_event = enqueue_event
+        self._publish_notification = publish_notification
         self._capabilities = list(capabilities or _handshake.DEFAULT_CAPABILITIES)
         self._error_replied_msg_ids: List[str] = []
 
@@ -342,6 +352,11 @@ class BackChannelDispatcher:
                 ),
                 verb=_address.HANDSHAKE_VERB,
             )
+            await self._notify(
+                to_session_key,
+                f"✅ back-channel established with {peer_address}",
+                "lifecycle",
+            )
             return
 
         if ptype == "handshake.established":
@@ -357,10 +372,18 @@ class BackChannelDispatcher:
                     "mismatch on %s — ignoring", channel_id,
                 )
                 return
+            transitioned = False
             if record.get("state") == ChannelState.INITIATING.value:
                 _channels.apply_transition(record, ChannelState.ESTABLISHED)
+                transitioned = True
             _channels.record_msg_id(record, msg_id)
             await client.write_channel(kv_key=kv_key, record=record)
+            if transitioned:  # idempotent re-confirms stay silent
+                await self._notify(
+                    to_session_key,
+                    f"✅ back-channel established with {peer_address}",
+                    "lifecycle",
+                )
             return
 
         if ptype == "handshake.reject":
@@ -379,6 +402,11 @@ class BackChannelDispatcher:
                 _channels.apply_transition(record, ChannelState.CLOSED)
                 _channels.record_msg_id(record, msg_id)
                 await client.write_channel(kv_key=kv_key, record=record)
+                await self._notify(
+                    to_session_key,
+                    f"❌ back-channel closed with {peer_address}",
+                    "lifecycle",
+                )
             return
 
     # ------------------------------------------------------------------
@@ -432,13 +460,23 @@ class BackChannelDispatcher:
         enqueued = self._enqueue_event(to_session_key, event)
         if not enqueued:
             # KV already recorded the msg_id; raising would redeliver
-            # into the same dedupe wall. Log loudly instead.
+            # into the same dedupe wall. Log loudly instead. No user
+            # notification either: "received" would be a lie when the
+            # turn was never injected.
             logger.warning(
                 "session_routing dispatcher: enqueue failed for %s "
                 "(msg_id=%s) — message recorded but not injected",
                 to_session_key, msg_id,
             )
             return
+
+        # User-visible mirror of the raw message (side-channel, not a
+        # session turn) — the agent's reply is a separate artifact.
+        await self._notify(
+            to_session_key,
+            f"🔄 back-channel from {peer_address}\n{body}",
+            "back_channel_in",
+        )
 
         # Delivery confirmation for sender-side correlation.
         await self._publish_payload(
@@ -469,6 +507,26 @@ class BackChannelDispatcher:
     # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
+
+    async def _notify(self, session_key: str, text: str, kind: str) -> None:
+        """Mirror a back-channel event into the user's chat (side-channel).
+
+        Best-effort by contract: the notification is pure display —
+        the envelope was already durably handled, so a broken platform
+        must not raise (raising here would trigger redelivery into the
+        dedupe wall). Accepts sync or async collaborators.
+        """
+        if self._publish_notification is None:
+            return
+        try:
+            result = self._publish_notification(session_key, text, kind)
+            if inspect.isawaitable(result):
+                await result
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "session_routing dispatcher: notification publish failed "
+                "for %s: %s", session_key, e,
+            )
 
     async def _record_seen(
         self,
