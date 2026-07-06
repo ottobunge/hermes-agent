@@ -35,9 +35,13 @@ The encode/decode pair is round-trippable across the wire.
 
 from __future__ import annotations
 
+import logging
 import os
 import re
 from typing import Optional
+
+
+logger = logging.getLogger(__name__)
 
 
 # ---------------------------------------------------------------------------
@@ -127,25 +131,34 @@ def resolve_gateway_id(explicit: Optional[str] = None) -> str:
     """Resolve the gateway_id for THIS hermes instance.
 
     Precedence:
-      1. ``explicit`` argument — used by tools that take it from config.yaml.
+      1. ``explicit`` argument — used by tests and any tool that wants to
+         pass a per-call override.
       2. ``HERMES_GATEWAY_ID`` env var — supported for parity with other
-         HERMES_* identifiers; we still treat it as a behavioral knob per
-         the project's env-vs-config policy (operator can choose).
-      3. ``_default_gateway_id()`` from ``hermes_cli.gateway_enroll`` —
+         HERMES_* identifiers; per AGENTS.md the policy is config.yaml
+         first, env as legacy/operator-override lever.
+      3. ``session_routing.gateway_id`` from ``~/.hermes/config.yaml``
+         — the operator-curated stable id. Operators who want a
+         cross-rebuild-stable id set it here.
+      4. ``_default_gateway_id()`` from ``hermes_cli.gateway_enroll`` —
          returns ``gw-<hostname>`` or ``gw-hermes`` when hostname is empty.
-
-    Note: AGENTS.md instructs that non-secret config (like a stable id) goes
-    in ``~/.hermes/config.yaml`` rather than env. We accept env for parity
-    with the existing HERMES_* names but document the config-file path in the
-    plugin manifest. Operators who want a stable id across rebuilds set it in
-    config — not via env.
     """
     if explicit:
         return explicit.strip()
     env_val = os.environ.get("HERMES_GATEWAY_ID", "").strip()
     if env_val:
         return env_val
-    # Imported lazily so the plugin module loads even if hermes_cli is absent.
+    # Config override: read session_routing.gateway_id from config.yaml.
+    # Imported lazily to avoid an import cycle (allow.py imports nats_client,
+    # address.py is imported by allow.py only at startup, but we keep the
+    # chain clean by importing inside the branch).
+    try:
+        from plugins.session_routing.allow import read_config_gateway_id
+        cfg_val = read_config_gateway_id()
+        if cfg_val:
+            return cfg_val
+    except Exception as e:  # noqa: BLE001 — config is best-effort, never fatal
+        # Bad YAML, missing PyYAML/future, anything — fall through to default.
+        logger.debug("session_routing: config gateway_id lookup failed: %s", e)
     from hermes_cli.gateway_enroll import _default_gateway_id
     return _default_gateway_id()
 
