@@ -43,6 +43,10 @@ logger = logging.getLogger(__name__)
 STREAM_NAME = "SESSIONS"
 PRESENCE_BUCKET = "session_presence"
 ALLOW_BUCKET = "session_allow"
+# Back-channel lifecycle + dedupe state (v0.3.0). Keyed by the KV-safe
+# form of channel_id (``:`` → ``.``, see channels.channel_id_to_kv_key —
+# NATS KV keys forbid ``:``). Value shape: channels.build_channel_record.
+CHANNELS_BUCKET = "session_channels"
 
 # Tunable defaults. Per-host overrides via ``session_routing.heartbeat_seconds``
 # / ``session_routing.presence_ttl_seconds`` in ``~/.hermes/config.yaml``
@@ -86,6 +90,7 @@ class NATSRoutingClient:
         self._js: Optional[Any] = None
         self._kv_presence = None
         self._kv_allow = None
+        self._kv_channels = None
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -168,6 +173,26 @@ class NATSRoutingClient:
                 logger.debug("session_routing: bind allow bucket: %s", e)
                 self._kv_allow = await self._js.key_value(bucket=ALLOW_BUCKET)
 
+            # KV channels bucket: back-channel lifecycle + dedupe rows,
+            # keyed by KV-safe channel_id. No TTL — channels are closed
+            # explicitly (handshake.bye / session end); rows are small
+            # (recent_msg_ids capped at 100).
+            try:
+                self._kv_channels = await self._js.create_key_value(
+                    bucket=CHANNELS_BUCKET,
+                    history=1,
+                    storage="file",
+                    description=(
+                        "Back-channel lifecycle/dedupe state for "
+                        "session-routing. Keyed by KV-safe channel_id "
+                        "(':' encoded as '.'); value holds peer_address, "
+                        "state, recent_msg_ids (cap 100), capabilities."
+                    ),
+                )
+            except Exception as e:
+                logger.debug("session_routing: bind channels bucket: %s", e)
+                self._kv_channels = await self._js.key_value(bucket=CHANNELS_BUCKET)
+
         except Exception as e:  # noqa: BLE001
             await self._cleanup()
             raise NATSRoutingUnreachable(f"connect failed: {e!r}") from e
@@ -175,6 +200,7 @@ class NATSRoutingClient:
     async def _cleanup(self) -> None:
         self._kv_presence = None
         self._kv_allow = None
+        self._kv_channels = None
         if self._nc is not None:
             try:
                 await self._nc.close()
@@ -290,6 +316,66 @@ class NATSRoutingClient:
         return list(data.get("sender_gateway_ids") or [])
 
     # ------------------------------------------------------------------
+    # Channel state (KV write / read / list / delete)
+    # ------------------------------------------------------------------
+    #
+    # Keys are the KV-SAFE channel id (channels.channel_id_to_kv_key).
+    # Callers own the sanitization so the raw ':' form never reaches
+    # the broker. KV is lifecycle/dedupe state only — never delivery
+    # authority.
+
+    async def write_channel(self, *, kv_key: str, record: Dict[str, Any]) -> None:
+        """Persist one channel row. Idempotent (overwrites)."""
+        if self._kv_channels is None:
+            raise NATSRoutingUnreachable("not connected")
+        body = json.dumps(record, ensure_ascii=False, separators=(",", ":"))
+        try:
+            await self._kv_channels.put(kv_key, body.encode("utf-8"))
+        except Exception as e:
+            raise NATSRoutingUnreachable(f"channel put failed: {e!r}") from e
+
+    async def read_channel(self, kv_key: str) -> Optional[Dict[str, Any]]:
+        """Read one channel row, or None if absent."""
+        if self._kv_channels is None:
+            raise NATSRoutingUnreachable("not connected")
+        try:
+            entry = await self._kv_channels.get(kv_key)
+            if entry is None or entry.value is None:
+                return None
+            return json.loads(entry.value.decode("utf-8"))
+        except Exception as e:
+            logger.debug("session_routing: channel read miss for %s: %s", kv_key, e)
+            return None
+
+    async def list_channels(self) -> List[Dict[str, Any]]:
+        """Enumerate all channel rows (parsed dicts, ``_kv_key`` attached)."""
+        if self._kv_channels is None:
+            raise NATSRoutingUnreachable("not connected")
+        try:
+            keys = await self._kv_channels.keys()
+        except Exception as e:
+            # nats-py raises NoKeysError on an empty bucket.
+            logger.debug("session_routing: channel keys empty/failed: %s", e)
+            return []
+        out: List[Dict[str, Any]] = []
+        for k in keys:
+            key = k.decode("utf-8") if isinstance(k, (bytes, bytearray)) else k
+            entry = await self.read_channel(key)
+            if entry is not None:
+                entry["_kv_key"] = key
+                out.append(entry)
+        return out
+
+    async def delete_channel(self, kv_key: str) -> None:
+        """Remove one channel row. Missing key is a no-op."""
+        if self._kv_channels is None:
+            raise NATSRoutingUnreachable("not connected")
+        try:
+            await self._kv_channels.delete(kv_key)
+        except Exception as e:
+            logger.debug("session_routing: channel delete miss for %s: %s", kv_key, e)
+
+    # ------------------------------------------------------------------
     # Publish routed message (JetStream, stream=SESSIONS)
     # ------------------------------------------------------------------
 
@@ -345,6 +431,7 @@ class NATSRoutingClient:
         allowed_sender_gateway_ids: List[str],
         timeout: float = DEFAULT_INBOX_PULL_TIMEOUT,
         consumer: Optional[str] = None,
+        auto_ack: bool = True,
     ) -> Dict[str, Any]:
         """Pull at most one pending message addressed to this gateway.
 
@@ -354,6 +441,16 @@ class NATSRoutingClient:
         multiple ``filter_subjects`` per consumer, so we use one consumer
         across the allow-list and the broker only delivers matching
         messages). Unauthorized senders' messages never even match.
+
+        Ack semantics: with ``auto_ack=True`` (legacy default) the
+        message is acked here, BEFORE the caller sees it — a caller
+        crash loses the message. Deferred mode (``auto_ack=False``)
+        skips the ack and returns the broker message as
+        ``message["ack_handle"]``; the caller MUST call
+        ``self.ack(handle)`` on the SAME connected client after it has
+        durably processed (validated, deduped, enqueued) the message.
+        Unacked messages are redelivered by JetStream — the recipient's
+        dedupe window makes redelivery idempotent.
 
         Returns ``{"message": None}`` if the queue is empty.
         """
@@ -412,10 +509,11 @@ class NATSRoutingClient:
             return {"message": None, "consumer": consumer_name, "filter": filters}
 
         msg = msgs[0]
-        try:
-            await msg.ack()
-        except Exception as e:
-            logger.warning("session_routing: inbox ack failed (will redeliver): %s", e)
+        if auto_ack:
+            try:
+                await msg.ack()
+            except Exception as e:
+                logger.warning("session_routing: inbox ack failed (will redeliver): %s", e)
 
         try:
             payload = json.loads(msg.data.decode("utf-8"))
@@ -427,34 +525,57 @@ class NATSRoutingClient:
             for k, v in msg.header.items():
                 headers_out[k] = ",".join(v) if isinstance(v, list) else str(v)
 
+        message_out: Dict[str, Any] = {
+            "subject": msg.subject,
+            # ``sequence`` is a SequencePair(consumer, stream).
+            # Use ``stream`` for the global stream seq; ``consumer``
+            # for per-consumer seq. Both downstream test surfaces
+            # only care that something monotonic-ish is returned.
+            "sequence": (
+                msg.metadata.sequence.stream
+                if msg.metadata and msg.metadata.sequence
+                else None
+            ),
+            "consumer_sequence": (
+                msg.metadata.sequence.consumer
+                if msg.metadata and msg.metadata.sequence
+                else None
+            ),
+            "timestamp": (
+                msg.metadata.timestamp.isoformat()
+                if msg.metadata and msg.metadata.timestamp
+                else None
+            ),
+            "headers": headers_out,
+            "payload": payload,
+        }
+        if not auto_ack:
+            # Deferred-ack handle: the raw broker message. Only valid
+            # while THIS client's connection is open.
+            message_out["ack_handle"] = msg
         return {
-            "message": {
-                "subject": msg.subject,
-                # ``sequence`` is a SequencePair(consumer, stream).
-                # Use ``stream`` for the global stream seq; ``consumer``
-                # for per-consumer seq. Both downstream test surfaces
-                # only care that something monotonic-ish is returned.
-                "sequence": (
-                    msg.metadata.sequence.stream
-                    if msg.metadata and msg.metadata.sequence
-                    else None
-                ),
-                "consumer_sequence": (
-                    msg.metadata.sequence.consumer
-                    if msg.metadata and msg.metadata.sequence
-                    else None
-                ),
-                "timestamp": (
-                    msg.metadata.timestamp.isoformat()
-                    if msg.metadata and msg.metadata.timestamp
-                    else None
-                ),
-                "headers": headers_out,
-                "payload": payload,
-            },
+            "message": message_out,
             "consumer": consumer_name,
             "filter": filters,
         }
+
+    async def ack(self, ack_handle: Any) -> bool:
+        """Ack a message fetched with ``auto_ack=False``.
+
+        Returns True on success. Failure is logged and returns False —
+        the broker will redeliver, and the caller's dedupe window
+        absorbs the duplicate.
+        """
+        if ack_handle is None:
+            return False
+        try:
+            await ack_handle.ack()
+            return True
+        except Exception as e:  # noqa: BLE001
+            logger.warning(
+                "session_routing: deferred ack failed (will redeliver): %s", e
+            )
+            return False
 
     # ------------------------------------------------------------------
     # Health check
