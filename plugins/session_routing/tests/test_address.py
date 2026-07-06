@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import os
 import unittest
+from unittest.mock import patch
 
 from plugins.session_routing.address import (
     AddressError,
@@ -181,6 +182,70 @@ class Resolve(unittest.TestCase):
                 os.environ.pop("HERMES_SESSION_KEY", None)
             else:
                 os.environ["HERMES_SESSION_KEY"] = old
+
+    def test_resolve_gateway_id_from_config(self):
+        # When neither explicit nor env is set, config.yaml value wins.
+        old_env = os.environ.pop("HERMES_GATEWAY_ID", None)
+        try:
+            with patch(
+                "plugins.session_routing.allow.read_config_gateway_id",
+                return_value="gw-from-config",
+            ):
+                self.assertEqual(resolve_gateway_id(), "gw-from-config")
+        finally:
+            if old_env is not None:
+                os.environ["HERMES_GATEWAY_ID"] = old_env
+
+    def test_resolve_gateway_id_env_beats_config(self):
+        # HERMES_GATEWAY_ID (env) is higher precedence than config.yaml.
+        old_env = os.environ.pop("HERMES_GATEWAY_ID", None)
+        try:
+            os.environ["HERMES_GATEWAY_ID"] = "gw-from-env"
+            with patch(
+                "plugins.session_routing.allow.read_config_gateway_id",
+                return_value="gw-from-config",
+            ):
+                self.assertEqual(resolve_gateway_id(), "gw-from-env")
+        finally:
+            if old_env is None:
+                os.environ.pop("HERMES_GATEWAY_ID", None)
+            else:
+                os.environ["HERMES_GATEWAY_ID"] = old_env
+
+    def test_resolve_gateway_id_explicit_beats_all(self):
+        # The argument trumps env AND config AND default.
+        old_env = os.environ.pop("HERMES_GATEWAY_ID", None)
+        try:
+            os.environ["HERMES_GATEWAY_ID"] = "gw-from-env"
+            with patch(
+                "plugins.session_routing.allow.read_config_gateway_id",
+                return_value="gw-from-config",
+            ):
+                self.assertEqual(
+                    resolve_gateway_id(explicit="gw-explicit"),
+                    "gw-explicit",
+                )
+        finally:
+            if old_env is None:
+                os.environ.pop("HERMES_GATEWAY_ID", None)
+            else:
+                os.environ["HERMES_GATEWAY_ID"] = old_env
+
+    def test_resolve_gateway_id_falls_back_to_default(self):
+        # No explicit, no env, no config.yaml → _default_gateway_id() (= gw-<hostname>).
+        old_env = os.environ.pop("HERMES_GATEWAY_ID", None)
+        try:
+            with patch(
+                "plugins.session_routing.allow.read_config_gateway_id",
+                return_value=None,
+            ):
+                result = resolve_gateway_id()
+                # Should be gw-<hostname>; we don't pin the hostname here
+                # (CI may run anywhere) but it must start with "gw-".
+                self.assertTrue(result.startswith("gw-"), msg=f"got {result!r}")
+        finally:
+            if old_env is not None:
+                os.environ["HERMES_GATEWAY_ID"] = old_env
 
     def test_my_address_both_supplied(self):
         self.assertEqual(

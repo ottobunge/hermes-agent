@@ -157,6 +157,59 @@ def read_presence_ttl_seconds(
     return value if value > 0 else default
 
 
+def read_config_gateway_id(
+    *,
+    config_yaml_text: Optional[str] = None,
+) -> Optional[str]:
+    """Return ``session_routing.gateway_id`` from config, or ``None`` if unset.
+
+    This is the operator override for the auto-derived ``gw-<hostname>``
+    id. ``resolve_gateway_id`` checks config BEFORE falling back to the
+    hostname-derived default so that operators who rename their machine
+    keep a stable cross-rebuild identity, while those who don't set the
+    field see no change.
+
+    Parsed with the same hand-rolled regex style as the rest of this
+    module so we don't pull PyYAML in as a hard dep. We accept a single
+    string or a quoted string (double or single quotes), trim
+    whitespace, and reject anything containing characters outside the
+    gateway-id charset. A bad value returns ``None`` rather than
+    raising — the next fallback in ``resolve_gateway_id`` (the env
+    var, then the hostname) takes over.
+
+    ``config_yaml_text`` is exposed for tests so they can pass a
+    fixture instead of touching ``$HERMES_HOME/config.yaml``.
+    """
+    import re
+
+    if config_yaml_text is None:
+        path = _config_yaml_path()
+        if not path.exists():
+            return None
+        try:
+            config_yaml_text = path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("session_routing: config.yaml read failed: %s", e)
+            return None
+
+    block = re.search(
+        r"^\s*session_routing:\s*$(.*?)(?=^\S|\Z)",
+        config_yaml_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not block:
+        return None
+    m = re.search(
+        r'^\s*gateway_id:\s*[\'"]?([A-Za-z0-9._\-]+)[\'"]?\s*$',
+        block.group(1),
+        re.MULTILINE,
+    )
+    if not m:
+        return None
+    value = m.group(1).strip()
+    return value or None
+
+
 async def read_dynamic_allow_list(
     *, servers: List[str], recipient_gateway_id: str
 ) -> List[str]:
