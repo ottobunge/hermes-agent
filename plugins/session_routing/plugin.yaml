@@ -1,5 +1,5 @@
 name: session-routing
-version: 0.1.0
+version: 0.3.0
 kind: standalone
 description: >
   Addressed message routing between live Hermes sessions, on a NATS
@@ -8,8 +8,9 @@ description: >
   "<gateway_id>/<session_key>".
 
   Three model tools:
-    session_handle          — return THIS session's canonical address so the
-                              operator can hand it to another agent.
+    session_handle          — identify this session (canonical address) so a
+                              peer agent can target it. Returns a paste-ready
+                              'share_text' the operator can copy verbatim.
     session_route_send      — publish a message to another session's
                               addressed inbox; recipient subscribes only to
                               senders in their allow-list so cross-session
@@ -41,4 +42,8 @@ provides_tools:
   - session_handle
   - session_route_send
   - session_routing_list
-hooks: []
+  - session_establish
+hooks:
+  - on_gateway_start
+  - on_gateway_stop
+  - on_session_finalize

@@ -371,5 +371,271 @@ class TestEffectiveAllowList(unittest.TestCase):
         self.assertIn("gw-static-b", eff)
 
 
+# ---------------------------------------------------------------------------
+# v0.3.0 back-channel protocol — live two-"gateway" round-trip + redelivery
+# ---------------------------------------------------------------------------
+
+
+class _FakeSessionSide:
+    """One simulated gateway side: dispatcher + inbox runner + captures."""
+
+    def __init__(self, gateway_id: str, session_key: str, session_id: str):
+        from plugins.session_routing.dispatcher import BackChannelDispatcher
+        from plugins.session_routing.inbox import InboxRunner
+
+        self.gateway_id = gateway_id
+        self.session_key = session_key
+        self.session_id = session_id
+        self.enqueued: list = []
+
+        self.dispatcher = BackChannelDispatcher(
+            servers=SERVERS,
+            my_gateway_id=gateway_id,
+            resolve_session_id=(
+                lambda sk: session_id if sk == session_key else None
+            ),
+            enqueue_event=self._enqueue,
+        )
+        self.runner = InboxRunner(
+            servers=SERVERS,
+            my_gateway_id=gateway_id,
+            on_message=self.dispatcher.handle,
+            poll_interval=0.1,
+            fetch_timeout=0.3,
+            broker_retry_delay=0.5,
+            auto_ack=False,
+        )
+
+    def _enqueue(self, session_key, event) -> bool:
+        self.enqueued.append((session_key, event))
+        return True
+
+    @property
+    def my_address(self) -> str:
+        return address.build(self.gateway_id, self.session_key)
+
+
+async def _wait_for(predicate, *, timeout=15.0, interval=0.1):
+    """Await an async predicate until truthy or timeout. Returns last value."""
+    deadline = asyncio.get_event_loop().time() + timeout
+    value = None
+    while asyncio.get_event_loop().time() < deadline:
+        value = await predicate()
+        if value:
+            return value
+        await asyncio.sleep(interval)
+    return value
+
+
+@_BROKER_GATE
+class TestBackChannelRoundTrip(unittest.TestCase):
+    """Full v0.3.0 flow over a REAL broker: handshake (request → ack →
+    established) driven by two live dispatchers, message.text injection
+    with prefix + metadata, ack_delivery correlation, redelivery dedupe,
+    and handshake.bye teardown."""
+
+    def test_two_session_round_trip_and_redelivery(self):
+        loop = asyncio.new_event_loop()
+        try:
+            loop.run_until_complete(self._run())
+        finally:
+            loop.close()
+
+    async def _run(self):
+        from plugins.session_routing import channels as _channels
+        from plugins.session_routing import handshake as _handshake
+        from plugins.session_routing import protocol as _protocol
+        from plugins.session_routing.nats_client import NATSRoutingClient
+
+        tag = uuid.uuid4().hex[:6]
+        side_a = _FakeSessionSide(
+            f"gw-inta-{tag}", "agent:main:cli:bc-a",
+            f"20260706_000001_{tag}aa",
+        )
+        side_b = _FakeSessionSide(
+            f"gw-intb-{tag}", "agent:main:cli:bc-b",
+            f"20260706_000002_{tag}bb",
+        )
+
+        # Mutual allow-lists so both inboxes hear each other.
+        async with NATSRoutingClient(servers=SERVERS) as client:
+            await client.write_allow_list(
+                recipient_gateway_id=side_a.gateway_id,
+                sender_gateway_ids=[side_b.gateway_id],
+            )
+            await client.write_allow_list(
+                recipient_gateway_id=side_b.gateway_id,
+                sender_gateway_ids=[side_a.gateway_id],
+            )
+
+        side_a.runner.start()
+        side_b.runner.start()
+        kv_keys_to_cleanup = []
+        try:
+            # ── A initiates (exactly what session_establish publishes) ──
+            channel_id_a = _channels.channel_id_for(
+                side_a.session_id, side_b.my_address
+            )
+            kv_key_a = _channels.channel_id_to_kv_key(channel_id_a)
+            kv_keys_to_cleanup.append(kv_key_a)
+            machine = _handshake.HandshakeChannel(
+                channel_id=channel_id_a,
+                session_id=side_a.session_id,
+                my_address=side_a.my_address,
+                peer_address=side_b.my_address,
+            )
+            request = machine.start()
+            record = _channels.build_channel_record(
+                channel_id=channel_id_a,
+                session_id=side_a.session_id,
+                peer_address=side_b.my_address,
+                state=_channels.ChannelState.INITIATING,
+            )
+            record["role"] = "initiator"
+            record["nonce"] = request["nonce"]
+
+            async with NATSRoutingClient(servers=SERVERS) as client:
+                await client.write_channel(kv_key=kv_key_a, record=record)
+                envelope = routing.build_envelope(
+                    from_address=side_a.my_address,
+                    to_address=side_b.my_address,
+                    payload=request,
+                )
+                await client.publish_routed(
+                    subject=address.handshake_subject(
+                        side_a.gateway_id, side_b.session_key
+                    ),
+                    payload=envelope,
+                    headers=routing.envelope_to_headers(envelope),
+                )
+
+            # Handshake completes on BOTH sides (B acks, A establishes,
+            # B sees established).
+            async def _a_established():
+                rec = await _channels.load_channel(
+                    servers=SERVERS, channel_id=channel_id_a
+                )
+                return rec if rec and rec.get("state") == "ESTABLISHED" else None
+
+            rec_a = await _wait_for(_a_established)
+            self.assertIsNotNone(rec_a, "initiator side never ESTABLISHED")
+
+            channel_id_b = _channels.channel_id_for(
+                side_b.session_id, side_a.my_address
+            )
+            kv_keys_to_cleanup.append(
+                _channels.channel_id_to_kv_key(channel_id_b)
+            )
+
+            async def _b_established():
+                rec = await _channels.load_channel(
+                    servers=SERVERS, channel_id=channel_id_b
+                )
+                return rec if rec and rec.get("state") == "ESTABLISHED" else None
+
+            rec_b = await _wait_for(_b_established)
+            self.assertIsNotNone(rec_b, "responder side never ESTABLISHED")
+
+            # ── message.text A → B, injected exactly once ──
+            text_payload = _protocol.build_message_text(
+                channel_id=channel_id_a,
+                session_id=side_a.session_id,
+                body="ping from A",
+            )
+            text_envelope = routing.build_envelope(
+                from_address=side_a.my_address,
+                to_address=side_b.my_address,
+                payload=text_payload,
+            )
+            async with NATSRoutingClient(servers=SERVERS) as client:
+                for _ in range(2):  # publish TWICE: redelivery simulation
+                    await client.publish_routed(
+                        subject=address.encode_subject(
+                            side_a.gateway_id, side_b.session_key,
+                            verb="deliver",
+                        ),
+                        payload=text_envelope,
+                        headers=routing.envelope_to_headers(text_envelope),
+                    )
+
+            async def _b_got_text():
+                return side_b.enqueued or None
+
+            self.assertIsNotNone(
+                await _wait_for(_b_got_text), "message.text never injected"
+            )
+            # Give the duplicate a moment to (wrongly) inject, then assert
+            # exactly ONE synthetic turn despite two publishes.
+            await asyncio.sleep(2.0)
+            self.assertEqual(
+                len(side_b.enqueued), 1,
+                "redelivered envelope must inject exactly one synthetic turn",
+            )
+            session_key, event = side_b.enqueued[0]
+            self.assertEqual(session_key, side_b.session_key)
+            self.assertEqual(
+                event.text,
+                f"[back-channel from {side_a.my_address}] ping from A",
+            )
+            self.assertTrue(event.internal)
+            self.assertEqual(event.metadata["channel_id"], channel_id_b)
+            self.assertEqual(
+                event.metadata["envelope_msg_id"], text_envelope["msg_id"]
+            )
+
+            # ── ack_delivery correlation lands in A's dedupe window ──
+            async def _a_saw_ack():
+                rec = await _channels.load_channel(
+                    servers=SERVERS, channel_id=channel_id_a
+                )
+                ids = (rec or {}).get("recent_msg_ids") or []
+                # request msg (no: that's B's window); A's window gains the
+                # ack_delivery envelope id — anything beyond initial state.
+                return rec if ids else None
+
+            self.assertIsNotNone(
+                await _wait_for(_a_saw_ack),
+                "ack_delivery never reached the initiator",
+            )
+
+            # ── bye A → B closes B's side ──
+            bye = _handshake.build_bye(
+                channel_id=channel_id_a, session_id=side_a.session_id
+            )
+            bye_envelope = routing.build_envelope(
+                from_address=side_a.my_address,
+                to_address=side_b.my_address,
+                payload=bye,
+            )
+            async with NATSRoutingClient(servers=SERVERS) as client:
+                await client.publish_routed(
+                    subject=address.handshake_subject(
+                        side_a.gateway_id, side_b.session_key
+                    ),
+                    payload=bye_envelope,
+                    headers=routing.envelope_to_headers(bye_envelope),
+                )
+
+            async def _b_closed():
+                rec = await _channels.load_channel(
+                    servers=SERVERS, channel_id=channel_id_b
+                )
+                return rec if rec and rec.get("state") == "CLOSED" else None
+
+            self.assertIsNotNone(
+                await _wait_for(_b_closed), "handshake.bye never closed B"
+            )
+        finally:
+            await side_a.runner.stop(timeout=3.0)
+            await side_b.runner.stop(timeout=3.0)
+            # Scratch-row cleanup (best-effort).
+            try:
+                async with NATSRoutingClient(servers=SERVERS) as client:
+                    for key in kv_keys_to_cleanup:
+                        await client.delete_channel(key)
+            except Exception:  # noqa: BLE001
+                pass
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -16,15 +16,25 @@ Three model tools:
                                subjects from trusted gateway_ids).
   - ``session_routing_list`` — enumerate live sessions, freshness-filtered.
 
-Phase 1 scope:
-  - No auth (LAN + Courier VPN is the access boundary).
-  - One JetStream stream (reused from session-bridge), two KV buckets
-    (``session_presence``, ``session_allow``).
-  - Heartbeat presence: NOT started by this plugin in v0.18.0 because
-    the runtime does not expose an ``on_gateway_start`` hook. We
-    document the gap below and SKIP the registration.
+v0.3.0 adds the full back-channel protocol:
 
-Versioning: v0.1.0 (Phase 1).
+  - ``session_establish``    — 3-way handshake opening a typed channel
+                               to a peer session (tools.py).
+  - Gateway lifecycle wiring — ``on_gateway_start`` starts the presence
+                               heartbeat (one row per gateway with ALL
+                               live session_keys) and the deferred-ack
+                               ``InboxRunner`` feeding the receive-side
+                               ``BackChannelDispatcher`` (runtime.py).
+  - ``on_gateway_stop``      — stops both before the agent drain.
+  - ``on_session_finalize``  — closes (handshake.bye) every open channel
+                               owned by the finalized session.
+
+Scope:
+  - No auth (LAN + Courier VPN is the access boundary).
+  - One JetStream stream (reused from session-bridge), three KV buckets
+    (``session_presence``, ``session_allow``, ``session_channels``).
+
+Versioning: v0.3.0.
 """
 
 from __future__ import annotations
@@ -56,6 +66,12 @@ _TOOLS = (
         _tools.SESSION_ROUTING_LIST_SCHEMA,
         _tools.handle_session_routing_list,
         "📋",
+    ),
+    (
+        "session_establish",
+        _tools.SESSION_ESTABLISH_SCHEMA,
+        _tools.handle_session_establish,
+        "🤝",
     ),
 )
 
@@ -112,7 +128,7 @@ def check_session_routing_requirements() -> bool:
 
 
 def register(ctx) -> None:
-    """Register the three tools. No CLI surface yet."""
+    """Register the model tools + gateway lifecycle hooks."""
 
     for name, schema, handler, emoji in _TOOLS:
         ctx.register_tool(
@@ -124,28 +140,12 @@ def register(ctx) -> None:
             emoji=emoji,
         )
 
+    # Lifecycle wiring (v0.3.0): the gateway awaits awaitable returns
+    # from on_gateway_start/stop; on_session_finalize schedules its own
+    # cleanup task. All failures are contained in runtime.py — a downed
+    # broker never blocks gateway startup/shutdown.
+    from plugins.session_routing.runtime import runtime
 
-# TODO(Phase 2): wire presence heartbeat via ctx.register_hook.
-#
-# The plugin manifest references ``on_gateway_start`` for the heartbeat
-# loop (presence.update_presence on a fixed cadence) but as of v0.18.0
-# the runtime's VALID_HOOKS set in hermes_cli/plugins.py does NOT
-# include that hook. The closest existing surfaces are
-# ``on_session_start`` / ``on_session_end``, which fire PER session —
-# not what we want for a per-gateway heartbeat that runs whether or
-# not any session is active.
-#
-# When the runtime exposes ``on_gateway_start`` (or the equivalent
-# generic lifecycle hook), replace this stub with:
-#
-#     async def on_gateway_start(ctx) -> None:
-#         servers = _broker_servers()
-#         heartbeat_seconds = read_heartbeat_seconds(default=30)
-#         # asyncio.create_task(presence_loop(servers, ...))  # noqa
-#
-# and add ``ctx.register_hook("on_gateway_start", on_gateway_start)``
-# to ``register()``. Until then, presence is the responsibility of an
-# out-of-band loop (e.g. a systemd timer or a separate process).
-def _unused_phase2_hook_stub(ctx) -> None:  # pragma: no cover
-    """Placeholder so the file stays importable while we wait for the hook."""
-    raise NotImplementedError("on_gateway_start hook not available in v0.18.0")
+    ctx.register_hook("on_gateway_start", runtime.on_gateway_start)
+    ctx.register_hook("on_gateway_stop", runtime.on_gateway_stop)
+    ctx.register_hook("on_session_finalize", runtime.on_session_finalize)
