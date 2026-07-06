@@ -159,6 +159,20 @@ VALID_HOOKS: Set[str] = {
     "api_request_error",
     "on_session_start",
     "on_session_end",
+    # Gateway process lifecycle hooks. Fired once per gateway process:
+    #   on_gateway_start — after all platform adapters are wired and the
+    #                      runner enters the "running" state. Runs ON the
+    #                      gateway's event loop; callbacks may return an
+    #                      awaitable (it is awaited) and may create
+    #                      long-lived asyncio tasks (heartbeats, inbox
+    #                      consumers).
+    #   on_gateway_stop  — at the START of graceful shutdown, before the
+    #                      active-agent drain, so plugin-owned consumers
+    #                      stop pulling work before sessions wind down.
+    # Contract: callback failures are logged and NEVER block gateway
+    # startup or shutdown. Kwargs: gateway: GatewayRunner.
+    "on_gateway_start",
+    "on_gateway_stop",
     "on_session_finalize",
     "on_session_reset",
     "subagent_start",
