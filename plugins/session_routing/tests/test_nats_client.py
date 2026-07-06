@@ -107,5 +107,62 @@ class ErrorClass(unittest.TestCase):
             self.assertIsInstance(caught.__cause__, ValueError)
 
 
+class DeferredAck(unittest.TestCase):
+    """client.ack() semantics for auto_ack=False fetches (offline)."""
+
+    def _run(self, coro):
+        import asyncio
+        return asyncio.run(coro)
+
+    def test_ack_none_handle_returns_false(self):
+        c = NATSRoutingClient(servers=["nats://localhost:4222"])
+        self.assertFalse(self._run(c.ack(None)))
+
+    def test_ack_success(self):
+        class FakeMsg:
+            def __init__(self):
+                self.acked = False
+
+            async def ack(self):
+                self.acked = True
+
+        c = NATSRoutingClient(servers=["nats://localhost:4222"])
+        msg = FakeMsg()
+        self.assertTrue(self._run(c.ack(msg)))
+        self.assertTrue(msg.acked)
+
+    def test_ack_failure_logged_not_raised(self):
+        class ExplodingMsg:
+            async def ack(self):
+                raise RuntimeError("connection gone")
+
+        c = NATSRoutingClient(servers=["nats://localhost:4222"])
+        self.assertFalse(self._run(c.ack(ExplodingMsg())))
+
+
+class HandshakeSubjects(unittest.TestCase):
+    """Handshake frames ride the same stream/filter as deliver frames."""
+
+    def test_handshake_subject_shape(self):
+        from plugins.session_routing.address import (
+            HANDSHAKE_VERB,
+            decode_subject,
+            handshake_subject,
+            subject_filter_for,
+        )
+        subject = handshake_subject("gw-thinkpad", "agent:main:telegram:dm:1:1")
+        self.assertEqual(
+            subject,
+            f"from.gw-thinkpad.agent:main:telegram:dm:1:1.{HANDSHAKE_VERB}",
+        )
+        # Recipient's allow-filter matches handshake subjects too.
+        prefix = subject_filter_for("gw-thinkpad")[:-1]  # strip '>'
+        self.assertTrue(subject.startswith(prefix))
+        # Round-trip: sender + recipient session_key recoverable.
+        sender, sk = decode_subject(subject)
+        self.assertEqual(sender, "gw-thinkpad")
+        self.assertEqual(sk, "agent:main:telegram:dm:1:1")
+
+
 if __name__ == "__main__":
     unittest.main()

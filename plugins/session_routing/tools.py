@@ -118,6 +118,62 @@ SESSION_ROUTE_SEND_SCHEMA: Dict[str, Any] = {
 }
 
 
+SESSION_ESTABLISH_SCHEMA: Dict[str, Any] = {
+    "name": "session_establish",
+    "description": (
+        "Open (or reuse) a typed back-channel to another live Hermes "
+        "session via a 3-way handshake. `target` is the peer's "
+        "canonical address ('<gateway_id>/<session_key>', from "
+        "session_routing_list or handed over by the user). Blocks up "
+        "to `timeout_seconds` waiting for the peer's ack. Returns "
+        "{ok: true, channel_id, peer_address, established_at, "
+        "peer_capabilities} on success — after which "
+        "session_route_send delivers visible messages the peer's user "
+        "sees in their chat. Idempotent: re-establishing to the same "
+        "target returns the existing channel. On failure returns "
+        "{ok: false, error: rejected|timeout|broker_unreachable|"
+        "bad_address|no_live_session_for_address|no_session}. If "
+        "`initial_message` is given it is sent as the first "
+        "message.text right after the handshake completes."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "target": {
+                "type": "string",
+                "description": (
+                    "Peer canonical address ('<gateway_id>/<session_key>')."
+                ),
+            },
+            "initial_message": {
+                "type": "string",
+                "description": (
+                    "Optional first message, delivered as message.text "
+                    "immediately after the channel is established."
+                ),
+            },
+            "capabilities": {
+                "type": "array",
+                "items": {"type": "string"},
+                "description": (
+                    "Capabilities to advertise (default: text, "
+                    "ack_delivery)."
+                ),
+            },
+            "timeout_seconds": {
+                "type": "number",
+                "description": (
+                    "How long to wait for the peer's handshake ack "
+                    "(default 30)."
+                ),
+            },
+        },
+        "required": ["target"],
+        "additionalProperties": False,
+    },
+}
+
+
 SESSION_ROUTING_LIST_SCHEMA: Dict[str, Any] = {
     "name": "session_routing_list",
     "description": (
@@ -311,6 +367,205 @@ def handle_session_route_send(
     except Exception as e:  # noqa: BLE001
         logger.exception("session_route_send failed")
         return {"ok": False, "error": "send_failed", "detail": repr(e)}
+
+
+ESTABLISH_POLL_INTERVAL_SECONDS = 0.5
+
+
+def _resolve_local_session_id(session_key: str) -> Optional[str]:
+    """This session's session_id (for channel_id construction).
+
+    In-gateway: resolved through the plugin runtime's session store
+    (task-safe). CLI/tests: ``HERMES_SESSION_ID`` env fallback.
+    """
+    if session_key:
+        try:
+            from plugins.session_routing.runtime import runtime
+            gw = runtime._gateway
+            if gw is not None:
+                entry = gw.session_store.get_entry(session_key)
+                if entry is not None and getattr(entry, "session_id", ""):
+                    return entry.session_id
+        except Exception as e:  # noqa: BLE001
+            logger.debug("session_establish: store lookup failed: %s", e)
+    return os.environ.get("HERMES_SESSION_ID", "").strip() or None
+
+
+def handle_session_establish(
+    target: str,
+    initial_message: Optional[str] = None,
+    capabilities: Optional[List[str]] = None,
+    timeout_seconds: float = 30.0,
+    **_kwargs: Any,
+) -> Dict[str, Any]:
+    """Open (or reuse) a back-channel to ``target`` via the 3-way handshake.
+
+    The tool publishes ``handshake.request`` and then POLLS the
+    ``session_channels`` KV: the receive-side dispatcher (inbox runner)
+    is what processes the peer's ``handshake.ack`` and transitions the
+    channel to ESTABLISHED — this handler never consumes from the inbox
+    itself, so it can't race the durable consumer's cursor.
+    """
+    from plugins.session_routing import channels as _channels
+    from plugins.session_routing import handshake as _handshake
+    from plugins.session_routing import protocol as _protocol
+
+    try:
+        address.parse(target)
+    except address.AddressError as e:
+        return {"ok": False, "error": "bad_address", "detail": str(e)}
+
+    try:
+        my_address = address.my_address()
+    except address.AddressError as e:
+        return {"ok": False, "error": "no_session", "detail": str(e)}
+    if target.strip() == my_address:
+        return {
+            "ok": False,
+            "error": "bad_address",
+            "detail": "cannot establish a back-channel with this session itself",
+        }
+
+    session_key = address.resolve_session_key()
+    local_session_id = _resolve_local_session_id(session_key)
+    if not local_session_id:
+        return {
+            "ok": False,
+            "error": "no_session",
+            "detail": "could not determine this session's session_id",
+        }
+
+    servers = _broker_servers()
+    ttl_seconds = _presence_ttl()
+    target_clean = target.strip()
+    channel_id = _channels.channel_id_for(local_session_id, target_clean)
+
+    async def _establish() -> Dict[str, Any]:
+        try:
+            entry = await presence.resolve_target(
+                servers=servers, address=target_clean, ttl_seconds=ttl_seconds,
+            )
+        except NATSRoutingUnreachable as e:
+            return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
+        if entry is None:
+            return {"ok": False, "error": "no_live_session_for_address"}
+
+        kv_key = _channels.channel_id_to_kv_key(channel_id)
+        sender_gw, _ = address.parse(my_address)
+        _, peer_sk = address.parse(target_clean)
+
+        async with NATSRoutingClient(servers=servers) as client:
+            record = await client.read_channel(kv_key)
+            if record and record.get("state") == _channels.ChannelState.ESTABLISHED.value:
+                # Idempotent: same target + same session → existing channel.
+                result = _success_result(record)
+                if initial_message:
+                    result["initial_message_msg_id"] = await _send_text(
+                        client, sender_gw, peer_sk, initial_message
+                    )
+                return result
+
+            # Fresh handshake (also for CLOSED/REJECTED/stale-INITIATING
+            # records: a new nonce supersedes; the responder re-acks).
+            machine = _handshake.HandshakeChannel(
+                channel_id=channel_id,
+                session_id=local_session_id,
+                my_address=my_address,
+                peer_address=target_clean,
+                timeout_seconds=timeout_seconds,
+            )
+            request = machine.start(capabilities=capabilities)
+            record = _channels.build_channel_record(
+                channel_id=channel_id,
+                session_id=local_session_id,
+                peer_address=target_clean,
+                state=_channels.ChannelState.INITIATING,
+            )
+            record["role"] = "initiator"
+            record["nonce"] = request["nonce"]
+            # KV row BEFORE publish: the dispatcher validates the ack's
+            # nonce against this record.
+            await client.write_channel(kv_key=kv_key, record=record)
+
+            envelope = routing.build_envelope(
+                from_address=my_address,
+                to_address=target_clean,
+                payload=request,
+            )
+            await client.publish_routed(
+                subject=address.handshake_subject(sender_gw, peer_sk),
+                payload=envelope,
+                headers=routing.envelope_to_headers(envelope),
+            )
+
+        # Poll KV until the dispatcher lands the terminal state.
+        deadline = asyncio.get_event_loop().time() + max(timeout_seconds, 0.1)
+        while asyncio.get_event_loop().time() < deadline:
+            await asyncio.sleep(ESTABLISH_POLL_INTERVAL_SECONDS)
+            record = await _channels.load_channel(
+                servers=servers, channel_id=channel_id
+            )
+            state = (record or {}).get("state")
+            if state == _channels.ChannelState.ESTABLISHED.value:
+                result = _success_result(record)
+                if initial_message:
+                    async with NATSRoutingClient(servers=servers) as client:
+                        result["initial_message_msg_id"] = await _send_text(
+                            client, sender_gw, peer_sk, initial_message
+                        )
+                return result
+            if state == _channels.ChannelState.REJECTED.value:
+                return {
+                    "ok": False,
+                    "error": "rejected",
+                    "reason": record.get("reject_reason"),
+                }
+        return {"ok": False, "error": "timeout", "timeout_seconds": timeout_seconds}
+
+    def _success_result(record: Dict[str, Any]) -> Dict[str, Any]:
+        return {
+            "ok": True,
+            "channel_id": channel_id,
+            "peer_address": target_clean,
+            "established_at": record.get("opened_at"),
+            "peer_capabilities": list(record.get("capabilities") or []),
+        }
+
+    async def _send_text(
+        client: "NATSRoutingClient",
+        sender_gw: str,
+        peer_sk: str,
+        body: str,
+    ) -> Optional[str]:
+        payload = _protocol.build_message_text(
+            channel_id=channel_id,
+            session_id=local_session_id,
+            body=body,
+        )
+        envelope = routing.build_envelope(
+            from_address=my_address, to_address=target_clean, payload=payload,
+        )
+        try:
+            await client.publish_routed(
+                subject=address.encode_subject(sender_gw, peer_sk, verb="deliver"),
+                payload=envelope,
+                headers=routing.envelope_to_headers(envelope),
+            )
+            return envelope["msg_id"]
+        except NATSRoutingUnreachable as e:
+            logger.warning(
+                "session_establish: initial_message publish failed: %s", e
+            )
+            return None
+
+    try:
+        return _run_async(_establish())
+    except NATSRoutingUnreachable as e:
+        logger.warning("session_establish: broker unreachable: %s", e)
+        return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
+    except Exception as e:  # noqa: BLE001
+        logger.exception("session_establish failed")
+        return {"ok": False, "error": "establish_failed", "detail": repr(e)}
 
 
 def handle_session_routing_list(

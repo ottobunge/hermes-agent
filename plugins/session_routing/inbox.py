@@ -78,6 +78,7 @@ class InboxRunner:
         empty_backoff_max: float = DEFAULT_EMPTY_BACKOFF_MAX,
         broker_retry_delay: float = DEFAULT_BROKER_RETRY_DELAY,
         fetch_timeout: float = DEFAULT_FETCH_TIMEOUT,
+        auto_ack: bool = True,
     ) -> None:
         if not servers:
             raise ValueError("InboxRunner requires at least one server URL.")
@@ -93,6 +94,13 @@ class InboxRunner:
         self._empty_backoff_max = empty_backoff_max
         self._broker_retry_delay = broker_retry_delay
         self._fetch_timeout = fetch_timeout
+        # Deferred-ack mode (auto_ack=False): the broker message is acked
+        # only AFTER the callback returns without raising, so a callback
+        # crash leaves the message in the stream for redelivery instead of
+        # silently losing it. The receive-side dispatcher runs in this
+        # mode ("dedupe before NATS ack" — its persisted dedupe window
+        # makes the redelivery idempotent).
+        self._auto_ack = auto_ack
 
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
@@ -186,6 +194,7 @@ class InboxRunner:
                                 my_gateway_id=self._my_gateway_id,
                                 allowed_sender_gateway_ids=self._current_allow,
                                 timeout=self._fetch_timeout,
+                                auto_ack=self._auto_ack,
                             )
                         except NATSRoutingUnreachable as e:
                             logger.warning(
@@ -207,7 +216,16 @@ class InboxRunner:
                             continue
 
                         empty_delay = self._poll_interval
-                        await self._dispatch(message)
+                        dispatched_ok = await self._dispatch(message)
+                        if not self._auto_ack:
+                            # Ack order (deferred mode): the callback has
+                            # validated/deduped/enqueued durably — only
+                            # now confirm consumption to the broker. On
+                            # callback failure we skip the ack and let
+                            # JetStream redeliver.
+                            ack_handle = message.get("ack_handle")
+                            if dispatched_ok and ack_handle is not None:
+                                await client.ack(ack_handle)
 
             except NATSRoutingUnreachable as e:
                 logger.warning(
@@ -224,11 +242,13 @@ class InboxRunner:
                 )
                 await self._sleep_or_stop(self._broker_retry_delay)
 
-    async def _dispatch(self, message: Dict[str, Any]) -> None:
+    async def _dispatch(self, message: Dict[str, Any]) -> bool:
         """Invoke the callback for one delivered message.
 
         Callback errors are logged but never propagate — a buggy handler
-        must not take down the consumer loop.
+        must not take down the consumer loop. Returns True when the
+        callback completed without raising (the deferred-ack loop only
+        acks on True).
         """
         subject = message.get("subject", "")
         headers = dict(message.get("headers") or {})
@@ -237,12 +257,14 @@ class InboxRunner:
             result = self._on_message(payload, subject, headers)
             if asyncio.iscoroutine(result):
                 await result
+            return True
         except asyncio.CancelledError:
             raise
         except Exception as e:  # noqa: BLE001
             logger.exception(
                 "session_routing inbox: on_message callback raised: %r", e
             )
+            return False
 
     async def _sleep_or_stop(self, seconds: float) -> None:
         """Sleep up to ``seconds`` or until stop is requested.

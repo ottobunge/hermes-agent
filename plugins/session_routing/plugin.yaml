@@ -1,5 +1,5 @@
 name: session-routing
-version: 0.1.0
+version: 0.3.0
 kind: standalone
 description: >
   Addressed message routing between live Hermes sessions, on a NATS
@@ -41,4 +41,8 @@ provides_tools:
   - session_handle
   - session_route_send
   - session_routing_list
-hooks: []
+  - session_establish
+hooks:
+  - on_gateway_start
+  - on_gateway_stop
+  - on_session_finalize

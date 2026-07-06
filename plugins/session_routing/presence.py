@@ -51,6 +51,7 @@ def build_presence_entry(
     session_key: str,
     platform: Optional[str],
     extra: Optional[Dict[str, Any]] = None,
+    live_sessions: Optional[List[str]] = None,
 ) -> Dict[str, Any]:
     """Build the canonical presence payload for one gateway tick.
 
@@ -58,12 +59,21 @@ def build_presence_entry(
     string here because ``is_fresh()`` parses floats and we want to keep
     the math simple. The ISO string is also written (``last_seen_iso``)
     for human readers on KV dump.
+
+    ``live_sessions`` (v0.3.0) lists ALL session_keys currently live on
+    the gateway — presence is one row per gateway, and a single
+    ``session_key`` cannot answer "is peer session X live here?" for
+    cross-host sends targeting arbitrary sessions. Backward compatible:
+    ``session_key`` stays populated (falling back to the first live
+    session) so pre-v0.3.0 readers keep working.
     """
     now = time.time()
+    sessions = [s for s in (live_sessions or []) if s]
     entry: Dict[str, Any] = {
         "agent_id": agent_id,
         "gateway_id": gateway_id,
-        "session_key": session_key,
+        "session_key": session_key or (sessions[0] if sessions else ""),
+        "live_sessions": sessions if sessions else ([session_key] if session_key else []),
         "platform": platform or "",
         "last_seen": now,
         "last_seen_iso": utc_now_iso(),
@@ -104,6 +114,7 @@ async def update_presence(
     session_key: str,
     platform: Optional[str],
     extra: Optional[Dict[str, Any]] = None,
+    live_sessions: Optional[List[str]] = None,
     timeout: float = 3.0,
 ) -> None:
     """Write THIS gateway's presence row. Best-effort; logs on failure."""
@@ -113,6 +124,7 @@ async def update_presence(
         session_key=session_key,
         platform=platform,
         extra=extra,
+        live_sessions=live_sessions,
     )
     entry["inbox_consumer"] = inbox_consumer_name(gateway_id)
     entry["advertising_address"] = advertising_address(gateway_id, session_key)
@@ -179,6 +191,11 @@ async def resolve_target(
         gateway_id_filter=gateway_id,
     )
     for e in live:
+        # v0.3.0: presence is one row per gateway carrying ALL live
+        # session_keys; match against the list. Legacy single
+        # ``session_key`` rows (pre-live_sessions writers) still match.
+        if session_key in (e.get("live_sessions") or []):
+            return e
         if e.get("session_key") == session_key:
             return e
     return None
