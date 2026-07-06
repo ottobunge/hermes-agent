@@ -166,12 +166,21 @@ def resolve_gateway_id(explicit: Optional[str] = None) -> str:
 def resolve_session_key(explicit: Optional[str] = None) -> str:
     """Resolve the session_key for THIS session.
 
-    Precedence: ``explicit`` arg → ``HERMES_SESSION_KEY`` env var →
-    empty string. We never silently invent a key, so if both are empty the
-    call site surfaces a config error to the user.
+    Precedence: ``explicit`` arg → gateway session contextvar (task-local,
+    concurrency-safe — inside the gateway two concurrent sessions must
+    not read each other's key) → ``HERMES_SESSION_KEY`` env var → empty
+    string. We never silently invent a key, so if all are empty the call
+    site surfaces a config error to the user.
     """
     if explicit:
         return explicit.strip()
+    try:
+        from gateway.session_context import get_session_env
+        ctx_val = get_session_env("HERMES_SESSION_KEY", "").strip()
+        if ctx_val:
+            return ctx_val
+    except Exception:  # noqa: BLE001 — gateway package absent in CLI-only envs
+        pass
     env_val = os.environ.get("HERMES_SESSION_KEY", "").strip()
     return env_val
 
@@ -223,6 +232,15 @@ def my_address(gateway_id: Optional[str] = None,
 # aliasing.
 
 
+# Subject verbs. ``deliver`` carries message.* payloads; ``handshake``
+# carries handshake.* frames. Both flow through the SAME stream and the
+# same recipient inbox filter (``from.<sender>.>`` matches any verb) —
+# the verb is a human-readable discriminator for `nats sub -l` output,
+# the authoritative dispatch key is ``payload.type`` (protocol.py).
+DELIVER_VERB = "deliver"
+HANDSHAKE_VERB = "handshake"
+
+
 def encode_subject(
     sender_gateway_id: str,
     session_key: str,
@@ -248,6 +266,11 @@ def encode_subject(
     _check_no_forbidden(sender_gateway_id, "sender_gateway_id")
     _check_no_forbidden(session_key, "session_key")
     return f"from.{sender_gateway_id}.{session_key}.{verb}"
+
+
+def handshake_subject(sender_gateway_id: str, session_key: str) -> str:
+    """Subject for a handshake.* frame addressed to ``session_key``."""
+    return encode_subject(sender_gateway_id, session_key, verb=HANDSHAKE_VERB)
 
 
 def subject_filter_for(sender_gateway_id: str) -> str:
