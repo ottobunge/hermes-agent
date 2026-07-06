@@ -252,11 +252,18 @@ def _run_async(coro):
 # Handlers
 # ---------------------------------------------------------------------------
 
-def handle_session_handle(**_kwargs: Any) -> Dict[str, Any]:
+def handle_session_handle(
+    args: Optional[Dict[str, Any]] = None,
+    **_kwargs: Any,
+) -> Dict[str, Any]:
     """Return the calling session's canonical address.
 
     No broker call. Reads ``HERMES_SESSION_KEY`` and resolves the
     gateway_id via ``address.resolve_gateway_id``.
+
+    ``args`` is accepted positionally because the registry dispatcher
+    (tools/registry.py) calls handlers as ``entry.handler(args, **kwargs)``.
+    This handler takes no model-supplied fields, so ``args`` is ignored.
     """
     session_key = address.resolve_session_key()
     if not session_key:
@@ -316,12 +323,18 @@ def _notify_outbound(target: str, body: str) -> None:
 
 
 def handle_session_route_send(
-    target: str,
-    content: Dict[str, Any],
+    args: Optional[Dict[str, Any]] = None,
+    target: Optional[str] = None,
+    content: Optional[Dict[str, Any]] = None,
     reply_to: Optional[str] = None,
     **_kwargs: Any,
 ) -> Dict[str, Any]:
     """Validate, resolve, build, and publish a routed message.
+
+    The model passes ``{target, content, reply_to?}`` as a JSON object;
+    the registry dispatcher delivers that dict as our positional ``args``
+    parameter (see tools/registry.py). We also accept the same keys as
+    explicit kwargs to remain compatible with tests/direct callers.
 
     Steps:
       1. ``address.parse(target)`` — refuse malformed addresses.
@@ -335,6 +348,18 @@ def handle_session_route_send(
     envelope payload.
     """
 
+    # Accept both: dispatcher's positional ``args`` dict (production path)
+    # AND explicit kwargs (tests/direct callers). Dispatcher wins for any
+    # key it delivered.
+    if args is not None:
+        target = args.get("target", target)
+        content = args.get("content", content)
+        reply_to = args.get("reply_to", reply_to)
+
+    if not target:
+        return {"ok": False, "error": "missing_arg", "detail": "target is required"}
+    if content is None:
+        content = {}
     if not isinstance(content, dict):
         return {
             "ok": False,
@@ -434,7 +459,8 @@ def _resolve_local_session_id(session_key: str) -> Optional[str]:
 
 
 def handle_session_establish(
-    target: str,
+    args: Optional[Dict[str, Any]] = None,
+    target: Optional[str] = None,
     initial_message: Optional[str] = None,
     capabilities: Optional[List[str]] = None,
     timeout_seconds: float = 30.0,
@@ -448,6 +474,21 @@ def handle_session_establish(
     channel to ESTABLISHED — this handler never consumes from the inbox
     itself, so it can't race the durable consumer's cursor.
     """
+    # Dispatcher path: ``args`` is the JSON dict the model produced.
+    # Tests / direct callers pass the same fields as explicit kwargs.
+    if args is not None:
+        target = args.get("target", target)
+        initial_message = args.get("initial_message", initial_message)
+        capabilities = args.get("capabilities", capabilities)
+        if "timeout_seconds" in args:
+            try:
+                timeout_seconds = float(args["timeout_seconds"])
+            except (TypeError, ValueError):
+                pass
+
+    if not target:
+        return {"ok": False, "error": "missing_arg", "detail": "target is required"}
+
     from plugins.session_routing import channels as _channels
     from plugins.session_routing import handshake as _handshake
     from plugins.session_routing import protocol as _protocol
@@ -617,6 +658,7 @@ def handle_session_establish(
 
 
 def handle_session_routing_list(
+    args: Optional[Dict[str, Any]] = None,
     gateway_id_filter: Optional[str] = None,
     **_kwargs: Any,
 ) -> Dict[str, Any]:
@@ -626,6 +668,9 @@ def handle_session_routing_list(
     the same shape as ``presence.list_live`` (each entry is a
     presence JSON dict augmented with ``_gateway_id``).
     """
+    if args is not None:
+        gateway_id_filter = args.get("gateway_id_filter", gateway_id_filter)
+
     servers = _broker_servers()
     ttl_seconds = _presence_ttl()
 
