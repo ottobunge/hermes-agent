@@ -240,6 +240,13 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
     ),
     # HF Agent Trace Viewer upload (hermes trace upload / /upload-trace).
     "tool.trace_upload": ("huggingface-hub==1.2.3",),
+    # Cross-agent typed coordination bus — publishes/consumes JSON events
+    # on a NATS JetStream broker. Single dependency (nats-py). Matches the
+    # ``session-bridge`` extra in pyproject.toml. Opt-in because most
+    # users don't run their own JetStream instance on day one; the
+    # plugin's ``check_fn`` hides ``session_emit``/``session_observe``
+    # from the schema until the broker is reachable.
+    "tool.session_bridge": ("nats-py==2.15.0",),
 }
 
 

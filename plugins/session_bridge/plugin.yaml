@@ -1,0 +1,32 @@
+name: session-bridge
+version: 0.1.0
+kind: standalone
+description: >
+  Cross-agent typed coordination bus. Provides session_emit and
+  session_observe model tools that publish/consume JSON events to/from
+  a NATS JetStream broker. Designed for off-Telegram agent-to-agent
+  coordination (the two-layer architecture rule from MEMORY.md — Raft
+  for human-readable chat, NATS for typed internal events that MUST
+  NOT surface on user-visible channels).
+
+  Phase 1 scope: no auth, single broker, single stream ("SESSIONS").
+  Phase 2 will add shared-token auth and per-agent subject ACLs.
+
+  Directory is intentionally `session_bridge/` (underscore): Python
+  identifiers require underscores, so the import path
+  `plugins.session_bridge.*` resolves cleanly. The plugin name in
+  `plugin.yaml` keeps the hyphen as a canonical user-facing ID.
+
+  Requires the optional ``nats-py==2.15.0`` Python dep (pulled via
+  ``uv pip install '.[session-bridge]'`` or `hermes plugins install
+  session-bridge`). Tools auto-hide from the schema when the broker
+  is unreachable so the agent sees "tool not available" instead of a
+  noisy failure mid-turn.
+author: OttoBunge
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - session_emit
+  - session_observe
+hooks: []
