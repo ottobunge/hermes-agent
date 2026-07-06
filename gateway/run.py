@@ -6817,7 +6817,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         await self.hooks.emit("gateway:startup", {
             "platforms": [p.value for p in self.adapters.keys()],
         })
-        
+
+        # Plugin gateway-lifecycle hook: adapters are wired and the runner
+        # is in the "running" state, so plugin callbacks can safely start
+        # long-lived tasks (presence heartbeats, inbox consumers) on this
+        # event loop.
+        await self._invoke_plugin_gateway_lifecycle_hook("on_gateway_start")
+
+
         if connected_count > 0:
             logger.info("Gateway running with %s platform(s)", connected_count)
         
@@ -7579,6 +7586,98 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     return
                 await asyncio.sleep(1)
 
+    async def _invoke_plugin_gateway_lifecycle_hook(self, hook_name: str) -> None:
+        """Fire a plugin gateway-lifecycle hook (on_gateway_start/stop).
+
+        Runs on the gateway event loop. Sync callback errors are already
+        swallowed by ``invoke_hook``; awaitable results are awaited here so
+        async plugin setup/teardown completes before the gateway proceeds,
+        each in its own try/except — a broken plugin never blocks gateway
+        startup or shutdown.
+        """
+        try:
+            from hermes_cli.plugins import invoke_hook as _invoke_hook
+            results = _invoke_hook(hook_name, gateway=self)
+        except Exception as e:
+            logger.warning("Plugin hook %s dispatch failed: %s", hook_name, e)
+            return
+        for ret in results:
+            if inspect.isawaitable(ret):
+                try:
+                    await ret
+                except Exception as e:
+                    logger.warning(
+                        "Plugin hook %s awaitable raised: %s", hook_name, e,
+                    )
+
+    def enqueue_internal_session_event(self, session_key: str, event) -> bool:
+        """Enqueue a synthetic MessageEvent into an existing session's lane.
+
+        Public seam for plugins (e.g. session-routing's back-channel
+        dispatcher) that need to inject an internal event as a normal
+        inbound turn. The event flows through the SAME adapter machinery
+        as a platform message — ``BasePlatformAdapter.handle_message`` —
+        so the Level-1 active-session guard and the ``_pending_messages``
+        turn-boundary FIFO apply. Never call ``_handle_message`` /
+        ``_handle_message_with_agent`` directly for this: that would
+        bypass the adapter guard and risk a duplicate concurrent agent
+        turn for the same session.
+
+        The event's ``internal`` flag is forced True (bypasses user
+        authorization, as for other synthetic events) and ``source``
+        defaults to the session's recorded origin.
+
+        Returns True when the event was handed to an adapter, False when
+        the session key is unknown or no adapter is available (logged,
+        never raises).
+        """
+        try:
+            entry = self.session_store.get_entry(session_key)
+        except Exception as e:
+            logger.warning(
+                "enqueue_internal_session_event: session lookup failed for %s: %s",
+                session_key, e,
+            )
+            return False
+        if entry is None:
+            logger.info(
+                "enqueue_internal_session_event: unknown session_key %s — dropping",
+                session_key,
+            )
+            return False
+
+        origin = entry.origin
+        if event.source is None:
+            if origin is None:
+                logger.info(
+                    "enqueue_internal_session_event: session %s has no origin "
+                    "and event carries no source — dropping",
+                    session_key,
+                )
+                return False
+            event.source = origin
+
+        platform = entry.platform or (
+            event.source.platform if event.source else None
+        )
+        adapter = self.adapters.get(platform) if platform else None
+        if adapter is None:
+            logger.info(
+                "enqueue_internal_session_event: no adapter for platform %s "
+                "(session %s) — dropping",
+                platform, session_key,
+            )
+            return False
+
+        event.internal = True
+        task = asyncio.create_task(adapter.handle_message(event))
+        try:
+            self._background_tasks.add(task)
+            task.add_done_callback(self._background_tasks.discard)
+        except (TypeError, AttributeError):
+            pass
+        return True
+
     async def stop(
         self,
         *,
@@ -7651,6 +7750,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             self._running = False
             self._draining = True
+
+            # Plugin gateway-lifecycle hook: fire BEFORE the drain so
+            # plugin-owned consumers (e.g. session-routing's inbox runner)
+            # stop pulling new work while active sessions wind down.
+            # getattr-guarded so duck-typed fake runners in tests (which
+            # call GatewayRunner.stop unbound) don't need the method.
+            _lifecycle_hook = getattr(
+                self, "_invoke_plugin_gateway_lifecycle_hook", None
+            )
+            if _lifecycle_hook is not None:
+                await _lifecycle_hook("on_gateway_stop")
 
             # Notify all chats with active agents BEFORE draining.
             # Adapters are still connected here, so messages can be sent.
