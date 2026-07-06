@@ -1,0 +1,44 @@
+name: session-routing
+version: 0.1.0
+kind: standalone
+description: >
+  Addressed message routing between live Hermes sessions, on a NATS
+  JetStream broker. Companion to session-bridge (which is broadcast /
+  observe) — session-routing is point-to-point delivery addressed by
+  "<gateway_id>/<session_key>".
+
+  Three model tools:
+    session_handle          — return THIS session's canonical address so the
+                              operator can hand it to another agent.
+    session_route_send      — publish a message to another session's
+                              addressed inbox; recipient subscribes only to
+                              senders in their allow-list so cross-session
+                              access is fail-closed.
+    session_routing_list    — enumerate live sessions known to the broker
+                              (KV presence), with optional filter by
+                              gateway_id / agent_id.
+
+  Phase 1 scope: no auth, single broker, 24h JetStream retention, allow-list
+  enforced at the *broker side* (recipient subscriber only matches subjects
+  from trusted gateway_ids). Config lives in ~/.hermes/config.yaml under
+  session_routing.{gateway_id, peers, presence_ttl_seconds}.
+
+  Directory is `session_routing/` (underscore): Python identifiers require
+  underscores, so the import path `plugins.session_routing.*` resolves
+  cleanly. The plugin name in plugin.yaml keeps the hyphen as the
+  canonical user-facing ID.
+
+  Requires the optional ``nats-py==2.15.0`` Python dep (pulled via
+  ``uv pip install '.[session-routing]'`` or `hermes plugins install
+  session-routing`). Tools auto-hide from the schema when the broker is
+  unreachable — same gate as session-bridge so the model sees "tool not
+  available" instead of a noisy failure mid-turn.
+author: OttoBunge
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - session_handle
+  - session_route_send
+  - session_routing_list
+hooks: []
