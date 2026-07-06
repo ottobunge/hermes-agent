@@ -109,6 +109,54 @@ def read_static_peers_from_disk() -> List[str]:
     return read_static_peers_from_yaml(text)
 
 
+def read_presence_ttl_seconds(
+    *,
+    default: int = 90,
+    config_yaml_text: Optional[str] = None,
+) -> int:
+    """Return ``session_routing.presence_ttl_seconds`` from config.
+
+    Falls back to ``default`` when the key is missing or unparseable.
+    We never raise on a bad config — the rest of the plugin should
+    still work; presence staleness is a UX nicety, not a correctness
+    invariant.
+
+    ``config_yaml_text`` is exposed for tests so they can pass a
+    fixture instead of touching ``$HERMES_HOME/config.yaml``.
+    """
+    import re
+
+    if config_yaml_text is None:
+        path = _config_yaml_path()
+        if not path.exists():
+            return default
+        try:
+            config_yaml_text = path.read_text(encoding="utf-8")
+        except OSError as e:
+            logger.warning("session_routing: config.yaml read failed: %s", e)
+            return default
+
+    block = re.search(
+        r"^\s*session_routing:\s*$(.*?)(?=^\S|\Z)",
+        config_yaml_text,
+        re.MULTILINE | re.DOTALL,
+    )
+    if not block:
+        return default
+    m = re.search(
+        r"^\s*presence_ttl_seconds:\s*([0-9]+)\s*$",
+        block.group(1),
+        re.MULTILINE,
+    )
+    if not m:
+        return default
+    try:
+        value = int(m.group(1))
+    except ValueError:
+        return default
+    return value if value > 0 else default
+
+
 async def read_dynamic_allow_list(
     *, servers: List[str], recipient_gateway_id: str
 ) -> List[str]:

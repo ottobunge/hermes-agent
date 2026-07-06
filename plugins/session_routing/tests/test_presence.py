@@ -9,7 +9,7 @@ from __future__ import annotations
 import unittest
 
 from plugins.session_routing.presence import (
-    advertising_subject_for,
+    advertising_address,
     build_presence_entry,
     inbox_consumer_name,
 )
@@ -65,15 +65,15 @@ class InboxConsumerName(unittest.TestCase):
         )
 
 
-class AdvertisingSubject(unittest.TestCase):
+class AdvertisingAddress(unittest.TestCase):
     def test_shape(self):
-        subj = advertising_subject_for(
-            session_key="agent:main:telegram:dm:189562939:39702",
+        addr = advertising_address(
             gateway_id="gw-thinkpad",
+            session_key="agent:main:telegram:dm:189562939:39702",
         )
         self.assertEqual(
-            subj,
-            "from.gw-thinkpad.agent:main:telegram:dm:189562939:39702.deliver",
+            addr,
+            "gw-thinkpad/agent:main:telegram:dm:189562939:39702",
         )
 
 

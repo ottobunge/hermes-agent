@@ -185,53 +185,91 @@ def my_address(gateway_id: Optional[str] = None,
 # NATS subject encoding
 # ---------------------------------------------------------------------------
 #
-# No escape layer is needed: we reject ``*`` and ``>`` at parse time above,
-# so every address maps to a unique subject segment without aliasing. The
-# subject shape below is reversible by ``.split`` because the segments
-# match exactly what the URL contained.
+# The NATS subject for a routed message is::
+#
+#     from.<sender_gateway_id>.<session_key>.deliver
+#
+# The SENDER's gateway_id is in the prefix (not the recipient's). That
+# matches the recipient-side allow-list filter ``from.<trusted_sender>.>``
+# which the recipient's inbox subscriber installs — senders not on the
+# allow list produce subjects the consumer doesn't match, so their
+# messages never even reach the recipient's broker-side queue. (Putting
+# the recipient's gateway_id in the prefix would create a sieve the
+# recipient can't apply: every send would qualify as long as it's
+# addressed to them.)
+#
+# ``session_key`` here is the RECIPIENT's session identifier (since the
+# recipient also sees this on their end — they want to know which of
+# THEIR sessions the message is addressed to). We deliberately do NOT
+# encode the recipient's gateway_id in the subject: it's redundant with
+# ``session_key`` (different gateways won't share session_keys) and it
+# would prevent the allow-list filter from working.
+#
+# No escape layer is needed: we reject ``*`` and ``>`` at parse time
+# above, so every address maps to a unique subject segment without
+# aliasing.
 
 
-def encode_subject(address: str, verb: str = "deliver") -> str:
-    """Build a NATS JetStream subject for routing to ``address``.
+def encode_subject(
+    sender_gateway_id: str,
+    session_key: str,
+    verb: str = "deliver",
+) -> str:
+    """Build a NATS JetStream subject for a routed message.
 
     Resulting shape:
-        ``from.<gateway_id>.<session_key_escaped>.deliver`` (when verb == 'deliver')
+        ``from.<sender_gateway_id>.<session_key>.<verb>``
 
-    The prefix ``from.<gateway_id>.`` segments the sender's namespace — same
-    convention as ``session-bridge`` so an allow-list checker at the receiver
-    can filter by ``from.<trusted_gw>.>`` patterns.
+    Caller passes the sender's gateway_id (resolved via
+    ``resolve_gateway_id()``) and the recipient's session_key. The
+    subject identifies the SENDER at the broker level so that recipient
+    inbox subscribers can filter on a per-sender allow-list
+    (``from.<trusted_sender>.>``).
 
-    Recipients can subscribe with the per-sender pattern
-    ``subject_allow_pattern(gateway_id)`` to hear only the senders they trust.
+    Recipients can subscribe to ``subject_filter_for(allowed_sender_gw)``
+    to hear only the senders they trust.
     """
-    gateway_id, session_key = parse(address)
+    from plugins.session_routing.address import _check_no_forbidden
     if not verb or "." in verb:
         raise AddressError(f"verb must be a single token, got {verb!r}")
-    return f"from.{gateway_id}.{session_key}.{verb}"
+    _check_no_forbidden(sender_gateway_id, "sender_gateway_id")
+    _check_no_forbidden(session_key, "session_key")
+    return f"from.{sender_gateway_id}.{session_key}.{verb}"
+
+
+def subject_filter_for(sender_gateway_id: str) -> str:
+    """Subject filter pattern a recipient uses to hear ALL sends FROM
+    ``sender_gateway_id``.
+
+    Pattern shape:
+        ``from.<sender_gateway_id>.>``
+    """
+    return f"from.{sender_gateway_id}.>"
 
 
 def decode_subject(subject: str) -> tuple[str, str]:
-    """Inverse of ``encode_subject`` for the deliver verb.
+    """Inverse of ``encode_subject``.
 
-    Splits back to ``(gateway_id, session_key)`` so a receiver can identify
-    the originating peer. Raises on shape mismatch.
+    Returns ``(sender_gateway_id, session_key)`` so a recipient can
+    identify the originating peer. The recipient's own identity is NOT
+    in the subject — use the envelope's ``to`` field for that.
+
+    Note: a valid routed-deliver subject is of the shape
+    ``from.<sender>.<recipient_sk>.deliver``. We accept any single-token
+    verb at the tail (forward-compat with verbs like ``delivered``,
+    ``read``, ``ack`` in Phase 2) — the model logic treats the verb as
+    opaque; we only need a non-empty, dot-free tail.
     """
     parts = subject.split(".")
-    if len(parts) < 4 or parts[0] != "from" or parts[-1] != "deliver":
+    if (
+        len(parts) < 4
+        or parts[0] != "from"
+        or not parts[-1]
+        or not parts[1]  # sender_gateway_id empty
+    ):
         raise AddressError(f"not a routed deliver subject: {subject!r}")
-    gateway_id = parts[1]
-    # The only segment delimiters in the subject are ``.``. Because we do
-    # NOT escape anything (forbidden chars rejected at parse time), the
-    # session_key is the join of everything between gateway_id and the
-    # trailing verb with ``.``.
+    sender_gateway_id = parts[1]  # already validated non-empty by the guard above
+    # All segments between the gateway_id and the trailing verb are the
+    # recipient's session_key, rejoined with ``.``.
     session_key = ".".join(parts[2:-1])
-    return gateway_id, session_key
-
-
-def subject_allow_pattern(gateway_id: str) -> str:
-    """Subject pattern a recipient uses to hear ALL sends FROM ``gateway_id``.
-
-    Pattern shape:
-        ``from.<gateway_id>.>``
-    """
-    return f"from.{gateway_id}.>"
+    return sender_gateway_id, session_key
