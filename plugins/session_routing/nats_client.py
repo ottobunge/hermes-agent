@@ -325,8 +325,12 @@ class NATSRoutingClient:
             ack = await asyncio.wait_for(_do(), timeout=timeout + 1.0)
         except Exception as e:
             raise NATSRoutingUnreachable(f"publish failed: {e!r}") from e
+        # nats-py 2.x's ``PubAck`` carries ``seq`` (not ``sequence`` —
+        # the latter is wrong on every version, session-bridge carries
+        # the same bug as an open TODO upstream). We use ``getattr``
+        # defensively in case a future rename happens.
         return {
-            "seq": getattr(ack, "sequence", None),
+            "seq": getattr(ack, "seq", None) or getattr(ack, "sequence", None),
             "stream": getattr(ack, "stream", STREAM_NAME),
         }
 
@@ -366,18 +370,32 @@ class NATSRoutingClient:
             return {"message": None, "consumer": consumer_name, "filter": None}
 
         try:
+            # Subject may not match our stream's filter (peek at SESSIONS
+            # stream filters). The model-facing error must be readable.
+            # nats-py 2.x requires ConsumerConfig, not a raw dict.
+            from nats.js.api import (
+                AckPolicy,
+                ConsumerConfig as _CC,
+                DeliverPolicy,
+            )
+            cfg = _CC(
+                durable_name=consumer_name,
+                name=consumer_name,
+                ack_policy=AckPolicy.EXPLICIT,
+                deliver_policy=DeliverPolicy.ALL,
+                max_waiting=1,
+                # Multi-subject filter (nats-py 2.10+, nats-server ≥2.10).
+                # The broker only delivers messages whose subject matches
+                # one of these — unlisted senders' messages never match.
+                filter_subjects=filters,
+            )
+            # When filter_subjects is set, the broker accepts it but
+            # nats-py's auto-subject selection still picks the first
+            # subject as the consumer's "primary" — which is harmless.
             sub = await self._js.pull_subscribe(
-                subject=filters[0],  # primary subject (required by nats-py)
+                subject=filters[0] if filters else "from.>",
                 durable=consumer_name,
-                config={
-                    "ack_policy": "explicit",
-                    "deliver_policy": "all",
-                    "max_waiting": 1,
-                    # The remaining filters are attached as additional
-                    # subject patterns. nats-py expects ``filter_subjects``
-                    # to be a list of strings.
-                    "filter_subjects": filters[1:],
-                },
+                config=cfg,
             )
         except Exception as e:
             raise NATSRoutingUnreachable(f"inbox subscribe failed: {e!r}") from e
@@ -412,7 +430,20 @@ class NATSRoutingClient:
         return {
             "message": {
                 "subject": msg.subject,
-                "sequence": msg.metadata.sequence.stream_seq if msg.metadata else None,
+                # ``sequence`` is a SequencePair(consumer, stream).
+                # Use ``stream`` for the global stream seq; ``consumer``
+                # for per-consumer seq. Both downstream test surfaces
+                # only care that something monotonic-ish is returned.
+                "sequence": (
+                    msg.metadata.sequence.stream
+                    if msg.metadata and msg.metadata.sequence
+                    else None
+                ),
+                "consumer_sequence": (
+                    msg.metadata.sequence.consumer
+                    if msg.metadata and msg.metadata.sequence
+                    else None
+                ),
                 "timestamp": (
                     msg.metadata.timestamp.isoformat()
                     if msg.metadata and msg.metadata.timestamp

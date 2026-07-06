@@ -9,9 +9,8 @@ by gateway_id, value is JSON::
       "platform":     "telegram",
       "last_seen":    1730000000.123,        # Unix-epoch seconds
       "inbox_consumer": "inbox-gw-thinkpad", # durable name we own
-      "advertising_subjects": [              # what subjects we currently
-        "from.gw-thinkpad.agent:main:telegram:dm:189562939:39702"
-      ]
+      "advertising_address":                # canonical addr other agents
+        "gw-thinkpad/agent:main:telegram:dm:189562939:39702",
     }
 
 The heartbeat loop (run in the gateway's startup hook — see __init__.py's
@@ -83,15 +82,18 @@ def inbox_consumer_name(gateway_id: str) -> str:
     return f"inbox-{gateway_id}"
 
 
-def advertising_subject_for(session_key: str, gateway_id: str) -> str:
-    """Subject that OTHER gateways would use to deliver TO us.
+def advertising_address(gateway_id: str, session_key: str) -> str:
+    """Canonical address that OTHER gateways should target to reach us.
 
-    Same shape as our publish subject — symmetric. Listed in the presence
-    entry so a curious operator can ``nats sub -l`` and see exactly what
-    to expect.
+    Returned as a ``<gateway_id>/<session_key>`` string. Per-sender
+    subject prefixes are computed at publish time (each sender's
+    gateway_id is in the subject prefix), so the right thing to
+    advertise is the recipient's canonical address — not a single
+    subject string. The presence entry persists this string verbatim;
+    a sender's ``session_route_send`` parses it and emits
+    ``from.<their-gw>.<our-sk>.deliver``.
     """
-    addr = f"{gateway_id}/{session_key}"
-    return encode_subject(addr, verb="deliver")
+    return f"{gateway_id}/{session_key}"
 
 
 async def update_presence(
@@ -113,9 +115,7 @@ async def update_presence(
         extra=extra,
     )
     entry["inbox_consumer"] = inbox_consumer_name(gateway_id)
-    entry["advertising_subjects"] = [
-        advertising_subject_for(session_key, gateway_id),
-    ]
+    entry["advertising_address"] = advertising_address(gateway_id, session_key)
     async with NATSRoutingClient(servers=servers) as client:
         try:
             await client.update_presence(gateway_id=gateway_id, presence_json=entry)
