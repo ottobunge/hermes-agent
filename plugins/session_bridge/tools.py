@@ -236,8 +236,9 @@ def _scope_subject(subject: str) -> str:
 
 
 def handle_session_emit(
-    subject: str,
-    payload: Dict[str, Any],
+    args: Optional[Dict[str, Any]] = None,
+    subject: Optional[str] = None,
+    payload: Optional[Dict[str, Any]] = None,
     headers: Optional[Dict[str, str]] = None,
     timeout: float = 5.0,
     **_kwargs: Any,
@@ -247,7 +248,23 @@ def handle_session_emit(
     Sync handlers are the Hermes tool convention (see plugins/google_meet/
     tools.py). ``asyncio.run`` is fine per-call here because the model's
     tool dispatch is synchronous and not running inside an event loop.
+
+    ``args`` is accepted positionally because the registry dispatcher
+    (tools/registry.py) calls handlers as ``entry.handler(args, **kwargs)``.
     """
+    if args is not None:
+        subject = args.get("subject", subject)
+        payload = args.get("payload", payload)
+        headers = args.get("headers", headers)
+        if "timeout" in args:
+            try:
+                timeout = float(args["timeout"])
+            except (TypeError, ValueError):
+                pass
+    if not subject:
+        return {"ok": False, "error": "missing_arg", "detail": "subject is required"}
+    if payload is None:
+        payload = {}
 
     async def _emit() -> Dict[str, Any]:
         client = _broker()
@@ -286,13 +303,25 @@ def handle_session_emit(
 
 
 def handle_session_observe(
-    subject: str,
+    args: Optional[Dict[str, Any]] = None,
+    subject: Optional[str] = None,
     mode: str = "latest",
     timeout: float = 1.0,
     consumer: Optional[str] = None,
     **_kwargs: Any,
 ) -> Dict[str, Any]:
     """Sync tool handler — see handle_session_emit() for asyncio.run rationale."""
+    if args is not None:
+        subject = args.get("subject", subject)
+        mode = args.get("mode", mode)
+        if "timeout" in args:
+            try:
+                timeout = float(args["timeout"])
+            except (TypeError, ValueError):
+                pass
+        consumer = args.get("consumer", consumer)
+    if not subject:
+        return {"ok": False, "error": "missing_arg", "detail": "subject is required"}
 
     async def _observe() -> Dict[str, Any]:
         client = _broker()
