@@ -56,11 +56,12 @@ logger = logging.getLogger(__name__)
 SESSION_HANDLE_SCHEMA: Dict[str, Any] = {
     "name": "session_handle",
     "description": (
-        "Return THIS session's canonical routing address so another "
-        "agent can deliver a message to it via session_route_send. "
-        "Format: '<gateway_id>/<session_key>'. No broker call — this "
-        "is a pure identity lookup that reads HERMES_SESSION_KEY and "
-        "the resolved gateway_id."
+        "Identify this session so it can be referenced by a peer agent. "
+        "Use this when the operator asks 'what's my session id', 'share "
+        "your session id', or wants to start a back-channel with you from "
+        "another bot. Returns the canonical address '<gateway_id>/<session_key>' "
+        "AND a 'share_text' field ready to paste back to the operator. "
+        "No broker call — pure identity lookup."
     ),
     "parameters": {
         "type": "object",
@@ -276,7 +277,42 @@ def handle_session_handle(**_kwargs: Any) -> Dict[str, Any]:
         "address": full_address,
         "gateway_id": gateway_id,
         "session_key": session_key,
+        # Paste-ready block: the operator's flow is "ask bot A for its
+        # id → paste to bot B", so the agent must not have to reformat.
+        "share_text": (
+            f"My session id is: `{full_address}`\n"
+            f"  gateway_id: `{gateway_id}`\n"
+            f"  session_key: `{session_key}`\n"
+            "You can use this to start a back-channel with me by asking "
+            "another agent to `session_establish` targeting this address."
+        ),
     }
+
+
+def _notify_outbound(target: str, body: str) -> None:
+    """Mirror an outgoing back-channel message into the sender's chat.
+
+    Fire-and-forget onto the gateway loop via the runtime module's
+    ``publish_notification_threadsafe`` (tool handlers run sync in
+    their own loop). Resolved at call time through the module so the
+    gateway wiring — and tests — can swap it. Never raises: the send
+    already succeeded, visibility is best-effort.
+    """
+    session_key = address.resolve_session_key()
+    if not session_key:
+        return
+    try:
+        from plugins.session_routing import runtime as _runtime
+
+        _runtime.publish_notification_threadsafe(
+            session_key,
+            f"↗ back-channel to {target}\n{body}",
+            "back_channel_out",
+        )
+    except Exception as e:  # noqa: BLE001
+        logger.debug(
+            "session_routing: outbound notification failed: %s", e
+        )
 
 
 def handle_session_route_send(
@@ -360,13 +396,19 @@ def handle_session_route_send(
         return {"ok": True, **ack}
 
     try:
-        return _run_async(_send())
+        result = _run_async(_send())
     except NATSRoutingUnreachable as e:
         logger.warning("session_route_send: broker unreachable: %s", e)
         return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
     except Exception as e:  # noqa: BLE001
         logger.exception("session_route_send failed")
         return {"ok": False, "error": "send_failed", "detail": repr(e)}
+
+    # Only chat-visible payloads get mirrored — protocol traffic
+    # (acks, errors) would be noise in the user's thread.
+    if result.get("ok") and content.get("type") == "message.text":
+        _notify_outbound(target, str(content.get("body") or ""))
+    return result
 
 
 ESTABLISH_POLL_INTERVAL_SECONDS = 0.5
@@ -559,13 +601,19 @@ def handle_session_establish(
             return None
 
     try:
-        return _run_async(_establish())
+        result = _run_async(_establish())
     except NATSRoutingUnreachable as e:
         logger.warning("session_establish: broker unreachable: %s", e)
         return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
     except Exception as e:  # noqa: BLE001
         logger.exception("session_establish failed")
         return {"ok": False, "error": "establish_failed", "detail": repr(e)}
+
+    # Mirror the initial message only when it actually went out (its
+    # msg_id is proof of publish, not just of an established channel).
+    if result.get("ok") and initial_message and result.get("initial_message_msg_id"):
+        _notify_outbound(target_clean, initial_message)
+    return result
 
 
 def handle_session_routing_list(
