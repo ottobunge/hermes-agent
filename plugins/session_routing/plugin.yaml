@@ -8,8 +8,9 @@ description: >
   "<gateway_id>/<session_key>".
 
   Three model tools:
-    session_handle          — return THIS session's canonical address so the
-                              operator can hand it to another agent.
+    session_handle          — identify this session (canonical address) so a
+                              peer agent can target it. Returns a paste-ready
+                              'share_text' the operator can copy verbatim.
     session_route_send      — publish a message to another session's
                               addressed inbox; recipient subscribes only to
                               senders in their allow-list so cross-session

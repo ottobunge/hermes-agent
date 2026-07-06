@@ -199,6 +199,146 @@ class FailurePaths(EstablishHarness):
         self.assertEqual(result["error"], "no_session")
 
 
+class OutboundNotifications(unittest.TestCase):
+    """↗ notifications for outgoing back-channel sends (F3 delta).
+
+    The tool handlers run sync (their own asyncio.run loop), so the
+    notification hops onto the gateway loop via the runtime module's
+    ``publish_notification_threadsafe`` — patched here to capture calls.
+    """
+
+    def setUp(self):
+        FakeClient.store = {}
+        FakeClient.published = []
+        FakeClient.respond_with = "ack"
+        self.notifications: List[Any] = []
+
+    def _fake_notify(self, session_key, text, kind="info", gateway=None):
+        self.notifications.append((session_key, text, kind))
+        return True
+
+    def _patches(self, resolve=_fake_resolve_target):
+        return (
+            patch.dict("os.environ", ENV),
+            patch("plugins.session_routing.tools.NATSRoutingClient", FakeClient),
+            patch(
+                "plugins.session_routing.nats_client.NATSRoutingClient",
+                FakeClient,
+            ),
+            patch.object(_presence, "resolve_target", resolve),
+            patch(
+                "plugins.session_routing.runtime."
+                "publish_notification_threadsafe",
+                self._fake_notify,
+            ),
+        )
+
+    def _text_content(self, body="ping"):
+        return {
+            "type": "message.text",
+            "channel_id": f"{MY_SID}:deadbeef",
+            "session_id": MY_SID,
+            "in_reply_to": None,
+            "protocol_version": 1,
+            "body": body,
+        }
+
+    def test_route_send_message_text_notifies_sender_session(self):
+        p1, p2, p3, p4, p5 = self._patches()
+        with p1, p2, p3, p4, p5:
+            result = _tools.handle_session_route_send(
+                target=PEER_ADDR, content=self._text_content("ping")
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            self.notifications,
+            [(MY_SK, f"↗ back-channel to {PEER_ADDR}\nping", "back_channel_out")],
+        )
+
+    def test_route_send_non_text_content_no_notification(self):
+        p1, p2, p3, p4, p5 = self._patches()
+        with p1, p2, p3, p4, p5:
+            result = _tools.handle_session_route_send(
+                target=PEER_ADDR,
+                content={"type": "message.ack_delivery", "in_reply_to": "x"},
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.notifications, [])
+
+    def test_route_send_failure_no_notification(self):
+        p1, p2, p3, p4, p5 = self._patches(resolve=_fake_resolve_target_offline)
+        with p1, p2, p3, p4, p5:
+            result = _tools.handle_session_route_send(
+                target=PEER_ADDR, content=self._text_content()
+            )
+        self.assertFalse(result["ok"])
+        self.assertEqual(self.notifications, [])
+
+    def test_establish_initial_message_notifies(self):
+        p1, p2, p3, p4, p5 = self._patches()
+        with p1, p2, p3, p4, p5:
+            result = _tools.handle_session_establish(
+                target=PEER_ADDR,
+                initial_message="hello over there",
+                timeout_seconds=3.0,
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            self.notifications,
+            [(
+                MY_SK,
+                f"↗ back-channel to {PEER_ADDR}\nhello over there",
+                "back_channel_out",
+            )],
+        )
+
+    def test_establish_without_initial_message_no_notification(self):
+        p1, p2, p3, p4, p5 = self._patches()
+        with p1, p2, p3, p4, p5:
+            result = _tools.handle_session_establish(
+                target=PEER_ADDR, timeout_seconds=3.0
+            )
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(self.notifications, [])
+
+
+class SessionHandleShareText(unittest.TestCase):
+    """share_text — paste-ready session id for the operator (F3 delta).
+
+    The operator's flow is copy/paste: ask one bot for its session id,
+    paste the block to the other bot. ``share_text`` is that block,
+    verbatim — the agent should not have to reformat anything.
+    """
+
+    def test_share_text_matches_expected_format(self):
+        with patch.dict("os.environ", ENV):
+            result = _tools.handle_session_handle()
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(
+            result["share_text"],
+            f"My session id is: `{MY_GW}/{MY_SK}`\n"
+            f"  gateway_id: `{MY_GW}`\n"
+            f"  session_key: `{MY_SK}`\n"
+            "You can use this to start a back-channel with me by asking "
+            "another agent to `session_establish` targeting this address.",
+        )
+
+    def test_share_text_contains_canonical_address_and_gateway_id(self):
+        with patch.dict("os.environ", ENV):
+            result = _tools.handle_session_handle()
+        self.assertTrue(result["ok"], result)
+        self.assertIn(f"`{result['address']}`", result["share_text"])
+        self.assertIn(f"`{result['gateway_id']}`", result["share_text"])
+
+    def test_no_session_has_no_share_text(self):
+        env = {k: v for k, v in ENV.items() if k != "HERMES_SESSION_KEY"}
+        with patch.dict("os.environ", env, clear=True):
+            result = _tools.handle_session_handle()
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "no_session")
+        self.assertNotIn("share_text", result)
+
+
 class SchemaSurface(unittest.TestCase):
     def test_schema_shape(self):
         schema = _tools.SESSION_ESTABLISH_SCHEMA
