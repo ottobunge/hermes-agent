@@ -82,6 +82,9 @@ class DispatcherHarness(unittest.TestCase):
         FakeClient.published = []
         self.enqueued: List[Any] = []
         self.enqueue_ok = True
+        self.notify_ok = True
+        self.notifications: List[Any] = []
+        self.ops: List[str] = []  # cross-collaborator ordering trace
         self.session_ids = {MY_SK: MY_SID}
 
         self.dispatcher = BackChannelDispatcher(
@@ -89,13 +92,21 @@ class DispatcherHarness(unittest.TestCase):
             my_gateway_id=MY_GW,
             resolve_session_id=lambda sk: self.session_ids.get(sk),
             enqueue_event=self._enqueue,
+            publish_notification=self._notify,
         )
 
     def _enqueue(self, session_key, event):
         if not self.enqueue_ok:
             return False
         self.enqueued.append((session_key, event))
+        self.ops.append("enqueue")
         return True
+
+    async def _notify(self, session_key, text, kind):
+        if not self.notify_ok:
+            raise RuntimeError("notification pipe broken")
+        self.notifications.append((session_key, text, kind))
+        self.ops.append("notify")
 
     def _handle(self, envelope, subject="from.gw-agent-vm.sk.deliver"):
         with patch(
@@ -407,6 +418,164 @@ class HandshakeFlow(DispatcherHarness):
         stored = self._local_record()
         self.assertEqual(stored["state"], "REJECTED")
         self.assertEqual(stored["reject_reason"], "channel_busy")
+
+
+class Notifications(DispatcherHarness):
+    """Code-published, user-visible system notifications (F3 delta).
+
+    The dispatcher mirrors every accepted back-channel event to the
+    platform via the injected ``publish_notification`` collaborator
+    (gateway's ``publish_internal_notification``). Notifications are a
+    side-channel display — they NEVER enter session history, and their
+    failure must never affect envelope handling.
+    """
+
+    def test_inbound_text_publishes_visible_notification(self):
+        envelope = _envelope(_text_payload("what's the status?"))
+        self._handle(envelope)
+
+        self.assertEqual(len(self.notifications), 1)
+        session_key, text, kind = self.notifications[0]
+        self.assertEqual(session_key, MY_SK)
+        self.assertEqual(
+            text, f"🔄 back-channel from {PEER_ADDR}\nwhat's the status?"
+        )
+        self.assertEqual(kind, "back_channel_in")
+
+    def test_notification_published_after_enqueue(self):
+        self._handle(_envelope(_text_payload()))
+        self.assertEqual(self.ops, ["enqueue", "notify"])
+
+    def test_duplicate_envelope_notifies_exactly_once(self):
+        envelope = _envelope(_text_payload())
+        self._handle(envelope)
+        self._handle(envelope)  # broker redelivery, same msg_id
+        self.assertEqual(len(self.notifications), 1)
+
+    def test_enqueue_failure_suppresses_notification(self):
+        # If the turn was NOT injected, telling the user "received" would
+        # be misleading — the warning log covers the operational side.
+        self.enqueue_ok = False
+        self._handle(_envelope(_text_payload()))
+        self.assertEqual(self.notifications, [])
+
+    def test_notification_failure_never_breaks_dispatch(self):
+        self.notify_ok = False
+        envelope = _envelope(_text_payload())
+        self._handle(envelope)  # must not raise
+        self.assertEqual(len(self.enqueued), 1)
+        # ack_delivery still goes back to the sender.
+        self.assertEqual(self._published_types(), ["message.ack_delivery"])
+
+    def test_dispatcher_without_publisher_still_works(self):
+        bare = BackChannelDispatcher(
+            servers=["nats://x:4222"],
+            my_gateway_id=MY_GW,
+            resolve_session_id=lambda sk: self.session_ids.get(sk),
+            enqueue_event=self._enqueue,
+        )
+        with patch(
+            "plugins.session_routing.dispatcher.NATSRoutingClient", FakeClient
+        ):
+            asyncio.run(bare.handle(_envelope(_text_payload()), "s", {}))
+        self.assertEqual(len(self.enqueued), 1)
+
+    def _seed_initiator_record(self, nonce="our-nonce"):
+        channel_id = _channels.channel_id_for(MY_SID, PEER_ADDR)
+        record = _channels.build_channel_record(
+            channel_id=channel_id,
+            session_id=MY_SID,
+            peer_address=PEER_ADDR,
+            state=ChannelState.INITIATING,
+        )
+        record["role"] = "initiator"
+        record["nonce"] = nonce
+        FakeClient.store[_channels.channel_id_to_kv_key(channel_id)] = record
+
+    def test_ack_established_notifies_lifecycle(self):
+        # Initiator side: peer's ack lands, channel goes ESTABLISHED.
+        self._seed_initiator_record()
+        ack = _handshake.build_ack(
+            channel_id=f"{PEER_SID}:22222222",
+            session_id=PEER_SID,
+            nonce="our-nonce",
+            in_reply_to="env-req",
+        )
+        self._handle(_envelope(ack))
+        self.assertEqual(
+            self.notifications,
+            [(MY_SK, f"✅ back-channel established with {PEER_ADDR}", "lifecycle")],
+        )
+
+    def test_ack_with_bad_nonce_no_notification(self):
+        self._seed_initiator_record()
+        ack = _handshake.build_ack(
+            channel_id=f"{PEER_SID}:22222222",
+            session_id=PEER_SID,
+            nonce="forged",
+            in_reply_to="env-req",
+        )
+        self._handle(_envelope(ack))
+        self.assertEqual(self.notifications, [])
+
+    def test_established_transition_notifies_lifecycle(self):
+        # Responder side: request → (we ack) → peer confirms established.
+        request = _handshake.build_request(
+            channel_id=f"{PEER_SID}:11111111",
+            session_id=PEER_SID,
+            nonce="nonce-1",
+        )
+        self._handle(_envelope(request))
+        self.assertEqual(self.notifications, [])  # not established yet
+
+        established = _handshake.build_established(
+            channel_id=f"{PEER_SID}:11111111",
+            session_id=PEER_SID,
+            nonce="nonce-1",
+            in_reply_to="whatever",
+        )
+        self._handle(_envelope(established))
+        self.assertEqual(
+            self.notifications,
+            [(MY_SK, f"✅ back-channel established with {PEER_ADDR}", "lifecycle")],
+        )
+
+        # An idempotent re-confirm (new msg_id, state already ESTABLISHED)
+        # must not produce a second ✅.
+        again = _handshake.build_established(
+            channel_id=f"{PEER_SID}:11111111",
+            session_id=PEER_SID,
+            nonce="nonce-1",
+            in_reply_to="whatever",
+        )
+        self._handle(_envelope(again))
+        self.assertEqual(len(self.notifications), 1)
+
+    def test_bye_notifies_closed(self):
+        channel_id = _channels.channel_id_for(MY_SID, PEER_ADDR)
+        record = _channels.build_channel_record(
+            channel_id=channel_id,
+            session_id=MY_SID,
+            peer_address=PEER_ADDR,
+            state=ChannelState.ESTABLISHED,
+        )
+        FakeClient.store[_channels.channel_id_to_kv_key(channel_id)] = record
+
+        bye = _handshake.build_bye(
+            channel_id=f"{PEER_SID}:33333333", session_id=PEER_SID
+        )
+        self._handle(_envelope(bye))
+        self.assertEqual(
+            self.notifications,
+            [(MY_SK, f"❌ back-channel closed with {PEER_ADDR}", "lifecycle")],
+        )
+
+    def test_bye_on_unknown_channel_no_notification(self):
+        bye = _handshake.build_bye(
+            channel_id=f"{PEER_SID}:33333333", session_id=PEER_SID
+        )
+        self._handle(_envelope(bye))
+        self.assertEqual(self.notifications, [])
 
 
 if __name__ == "__main__":
