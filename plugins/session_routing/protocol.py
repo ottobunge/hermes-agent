@@ -129,15 +129,22 @@ def validate_payload(payload: Any) -> Tuple[bool, Optional[str], Optional[str]]:
         # error code so senders get a uniform contract.
         return (False, ERROR_CODE_UNKNOWN_TYPE, f"unknown payload type {ptype!r}")
 
-    # Cross-cutting fields.
+    # Cross-cutting fields. The closed-registry spec requires channel_id
+    # and session_id on every payload, BUT interop with v0.2 senders
+    # (whose ``session_route_send`` wrapper produced minimal payloads
+    # with only ``body`` + ``type``) means we have to tolerate missing
+    # cross-cutting fields and let the dispatcher fill them in from
+    # envelope context. We still reject the obviously malformed
+    # (non-string-when-present).
     for field in ("channel_id", "session_id"):
-        value = payload.get(field)
-        if not isinstance(value, str) or not value:
-            return (
-                False,
-                ERROR_CODE_VALIDATION,
-                f"payload.{field} must be a non-empty string",
-            )
+        if field in payload:
+            value = payload[field]
+            if value is not None and (not isinstance(value, str) or not value):
+                return (
+                    False,
+                    ERROR_CODE_VALIDATION,
+                    f"payload.{field} must be a non-empty string when present",
+                )
     if "in_reply_to" in payload and payload["in_reply_to"] is not None:
         if not isinstance(payload["in_reply_to"], str):
             return (
@@ -145,13 +152,16 @@ def validate_payload(payload: Any) -> Tuple[bool, Optional[str], Optional[str]]:
                 ERROR_CODE_VALIDATION,
                 "payload.in_reply_to must be a string or null",
             )
-    version = payload.get("protocol_version")
-    if version != PROTOCOL_VERSION:
-        return (
-            False,
-            ERROR_CODE_VALIDATION,
-            f"payload.protocol_version must be {PROTOCOL_VERSION}, got {version!r}",
-        )
+    # protocol_version is optional for interop: pre-v0.3 senders did
+    # not emit it (they used envelope-level ``v: 1``). The dispatcher
+    # normalises to PROTOCOL_VERSION on receive.
+    if "protocol_version" in payload and payload["protocol_version"] is not None:
+        if payload["protocol_version"] != PROTOCOL_VERSION:
+            return (
+                False,
+                ERROR_CODE_VALIDATION,
+                f"payload.protocol_version must be {PROTOCOL_VERSION}, got {payload['protocol_version']!r}",
+            )
 
     # Per-type required extras.
     for field, types in _TYPE_REQUIRED_FIELDS[ptype].items():
