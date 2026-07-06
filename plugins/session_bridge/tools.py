@@ -43,8 +43,13 @@ SESSION_EMIT_SCHEMA: Dict[str, Any] = {
         "Publish a typed event to a NATS JetStream subject. Used to "
         "coordinate with sibling agents (e.g. Hermes-VMner) outside "
         "user-visible channels (Telegram / Mattermost). Subjects are "
-        "plain string identities — conventions: `peer.<agent_id>.inbox`, "
-        "`session.<session_id>.<verb>`, `system.<topic>`. Returns the "
+        "plain string identities — conventions: "
+        "`from.<agent_id>.peer.<peer_id>.inbox`, "
+        "`from.<agent_id>.session.<session_id>.<verb>`, "
+        "`from.<agent_id>.system.<topic>`. The `from.<HERMES_AGENT_ID>.` "
+        "prefix is added automatically if not present, so the model "
+        "can call `subject=peer.<peer_id>.inbox` and the publish lands "
+        "at `from.hermes-conrad.peer.<peer_id>.inbox`. Returns the "
         "JetStream seq number on success or a structured error on "
         "broker rejection."
     ),
@@ -200,6 +205,36 @@ def _run_async(coro):
     )
 
 
+def _scope_subject(subject: str) -> str:
+    """Return the subject prefixed with ``from.<HERMES_AGENT_ID>.`` unless
+    the caller already named it with a ``from.`` leading segment.
+
+    Per Phase 1 v1 convention: every emit MUST be attributable to one
+    sender; receivers should subscribe by trusted-sender prefix
+    (e.g. ``from.hermes-vmner.>``) to prevent impersonation.
+    """
+    import os
+    agent_id = os.environ.get("HERMES_AGENT_ID", "hermes-conrad")
+
+    # Already prefixed (e.g. caller spelled out the from-segment).
+    if subject.startswith("from.") and len(subject.split(".", 2)) >= 2:
+        # Make sure it's THEIR from-segment; if a different agent_id wrote
+        # it as the first segment, we refuse (callers must use their own).
+        first = subject.split(".", 2)[1]
+        if first == agent_id:
+            return subject
+        # Different agent as `from.` — refuse with structured error
+        # bound to the exception path in handle_session_emit.
+        raise ValueError(
+            f"subject {subject!r} is scoped to {first!r} but "
+            f"HERMES_AGENT_ID={agent_id!r}. Pick the right agent_id "
+            f"or strip the leading 'from.<id>.' and let the "
+            f"sender-scoping wrapper add it for you."
+        )
+
+    return f"from.{agent_id}.{subject}"
+
+
 def handle_session_emit(
     subject: str,
     payload: Dict[str, Any],
@@ -217,9 +252,15 @@ def handle_session_emit(
     async def _emit() -> Dict[str, Any]:
         client = _broker()
         try:
+            # Always scope by sender: the from.<HERMES_AGENT_ID>. prefix is
+            # added unless the caller explicitly named it themselves AND
+            # the from-segment matches this agent's id. Refusing
+            # cross-sender writes is the point — receivers trust the from
+            # segment as the sender identity and gate subscription on it.
+            scoped_subject = _scope_subject(subject)
             await client.connect()
             return await client.publish(
-                subject=subject,
+                subject=scoped_subject,
                 payload=payload,
                 headers=headers or {},
                 timeout=timeout,
@@ -229,6 +270,11 @@ def handle_session_emit(
 
     try:
         result = _run_async(_emit())
+    except ValueError as e:
+        # Cross-agent scope attempt — refuse loudly so the model sees
+        # the structured error rather than a silently-misrouted publish.
+        logger.warning("session_emit: scope rejected: %s", e)
+        return {"ok": False, "error": "scope_rejected", "detail": str(e)}
     except nats_client.NATSUnreachable as e:
         logger.warning("session_emit: broker unreachable: %s", e)
         return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
