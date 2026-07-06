@@ -2223,6 +2223,14 @@ class SessionStore:
 
         return entries
 
+    def get_entry(self, session_key: str) -> Optional[SessionEntry]:
+        """Return the entry for a session key, or None. Does not create."""
+        if not session_key:
+            return None
+        with self._lock:
+            self._ensure_loaded_locked()
+            return self._entries.get(session_key)
+
     def lookup_by_session_id(self, session_id: str) -> Optional[SessionEntry]:
         """Return the active session entry for a persisted session ID, if any."""
         if not session_id:
