@@ -238,6 +238,13 @@ LAZY_DEPS: dict[str, tuple[str, ...]] = {
         "mcp==1.26.0",
         "starlette==1.0.1",  # CVE-2026-48710 — keep in sync with pyproject [computer-use]
     ),
+    # Cross-agent typed coordination bus — publishes/consumes JSON events
+    # on a NATS JetStream broker. Single dependency (nats-py). Matches the
+    # ``session-bridge`` extra in pyproject.toml. Opt-in because most
+    # users don't run their own JetStream instance on day one; the
+    # plugin's ``check_fn`` hides ``session_emit``/``session_observe``
+    # from the schema until the broker is reachable.
+    "tool.session_bridge": ("nats-py==2.15.0",),
 }
 
 
