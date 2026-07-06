@@ -1671,6 +1671,9 @@ parallel-web = [
 session-bridge = [
     { name = "nats-py" },
 ]
+session-routing = [
+    { name = "nats-py" },
+]
 slack = [
     { name = "aiohttp" },
     { name = "slack-bolt" },
@@ -1808,6 +1811,7 @@ requires-dist = [
     { name = "mistralai", marker = "extra == 'mistral'", specifier = "==2.4.8" },
     { name = "modal", marker = "extra == 'modal'", specifier = "==1.3.4" },
     { name = "nats-py", marker = "extra == 'session-bridge'", specifier = "==2.15.0" },
+    { name = "nats-py", marker = "extra == 'session-routing'", specifier = "==2.15.0" },
     { name = "nemo-relay", marker = "extra == 'nemo-relay'", specifier = "==0.3" },
     { name = "numpy", marker = "extra == 'voice'", specifier = "==2.4.3" },
     { name = "openai", specifier = "==2.24.0" },
@@ -1857,7 +1861,7 @@ requires-dist = [
     { name = "websockets", specifier = "==15.0.1" },
     { name = "youtube-transcript-api", marker = "extra == 'youtube'", specifier = "==1.2.4" },
 ]
-provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "pty", "honcho", "supermemory", "mem0", "vision", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "session-bridge", "mistral", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
+provides-extras = ["anthropic", "exa", "firecrawl", "parallel-web", "fal", "edge-tts", "modal", "daytona", "hindsight", "dev", "messaging", "cron", "slack", "matrix", "wecom", "cli", "tts-premium", "voice", "pty", "honcho", "supermemory", "mem0", "vision", "mcp", "nemo-relay", "homeassistant", "sms", "teams", "computer-use", "acp", "session-bridge", "session-routing", "mistral", "bedrock", "vertex", "azure-identity", "termux", "termux-all", "dingtalk", "feishu", "google", "youtube", "web", "all"]
 
 [[package]]
 name = "hf-xet"
