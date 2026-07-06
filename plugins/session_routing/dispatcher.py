@@ -169,7 +169,15 @@ class BackChannelDispatcher:
             )
             return
 
+        # Normalise cross-cutting payload fields that v0.2 senders may
+        # have omitted. We resolve channel_id + session_id from
+        # envelope context (the same source of truth the build helpers
+        # use) so downstream code can rely on them being present.
         channel_id = _channels.channel_id_for(local_session_id, peer_address)
+        payload.setdefault("channel_id", channel_id)
+        payload.setdefault("session_id", local_session_id)
+        payload.setdefault("protocol_version", _protocol.PROTOCOL_VERSION)
+
         kv_key = _channels.channel_id_to_kv_key(channel_id)
 
         async with NATSRoutingClient(servers=self._servers) as client:
