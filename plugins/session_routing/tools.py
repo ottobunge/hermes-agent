@@ -38,7 +38,7 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from plugins.session_routing import address, presence, routing
+from plugins.session_routing import address, presence, protocol, routing
 from plugins.session_routing.allow import read_presence_ttl_seconds
 from plugins.session_routing.nats_client import (
     NATSRoutingClient,
@@ -387,6 +387,27 @@ def handle_session_route_send(
             "ok": False,
             "error": "bad_payload",
             "detail": f"content must be dict, got {type(content).__name__}",
+        }
+
+    # Fail closed at SEND time with the same validator the recipient's
+    # dispatcher runs. Publishing an unregistered payload used to return
+    # {ok: true, seq} and then die receive-side as a message.error the
+    # sender never saw (live incident 2026-07-07: every free-form
+    # 'content' was rejected by the peer with validation_error while
+    # the sender kept re-probing a channel that looked dead).
+    ok, error_code, detail = protocol.validate_payload(content)
+    if not ok:
+        return {
+            "ok": False,
+            "error": "invalid_payload",
+            "error_code": error_code,
+            "detail": detail,
+            "hint": (
+                "content must be a registered v0.3 payload the peer can "
+                'validate — for visible text use {"type": "message.text", '
+                '"body": "<your text>"}. Registered types: '
+                + ", ".join(sorted(protocol.REGISTERED_TYPES))
+            ),
         }
 
     try:
