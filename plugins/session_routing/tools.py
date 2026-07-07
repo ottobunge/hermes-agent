@@ -202,6 +202,28 @@ SESSION_ROUTING_LIST_SCHEMA: Dict[str, Any] = {
 }
 
 
+SESSION_INBOX_STATUS_SCHEMA: Dict[str, Any] = {
+    "name": "session_inbox_status",
+    "description": (
+        "Operator-visibility tool for the local session-routing inbox "
+        "consumer. Returns the runtime's view of the inbox runner: "
+        "is it running, is it healthy (i.e. has shown activity "
+        "recently), when was the last fetch/dispatch, how many "
+        "messages have been delivered, and how many times the "
+        "watchdog has respawned the runner due to silent-death. "
+        "Call this when you suspect the back-channel is broken or "
+        "want to verify the receiver side is alive. Returns "
+        "{ok: true, status: {...}} on success."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {},
+        "required": [],
+        "additionalProperties": False,
+    },
+}
+
+
 # ---------------------------------------------------------------------------
 # Broker resolution
 # ---------------------------------------------------------------------------
@@ -691,3 +713,27 @@ def handle_session_routing_list(
         return {"ok": False, "error": "list_failed", "detail": repr(e)}
 
     return {"ok": True, "live": live}
+
+
+def handle_session_inbox_status(
+    args: Optional[Dict[str, Any]] = None,
+    **_kwargs: Any,
+) -> Dict[str, Any]:
+    """Return the local inbox runner's health + activity snapshot.
+
+    Read-only — no broker round-trip, just a peek at the runtime
+    singleton. The status payload is operator-friendly: ``is_healthy``
+    is the load-bearing field; if False, the runner is either dead
+    or silent (no recent fetches/dispatches) and the watchdog is
+    either respawning it or will on its next tick.
+
+    Use this whenever the back-channel seems to be "stuck" — it
+    gives the operator (and you, the model) immediate visibility
+    into the receiver side without having to grep gateway.log.
+    """
+    # Imported here (not at module top) to keep this tool's import
+    # graph tight — runtime.py pulls in the full dispatcher.
+    from plugins.session_routing.runtime import runtime as _runtime
+
+    status = _runtime.inbox_status()
+    return {"ok": True, "status": status}
