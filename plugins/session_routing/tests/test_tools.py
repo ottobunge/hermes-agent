@@ -355,5 +355,56 @@ class SchemaSurface(unittest.TestCase):
         self.assertIn("session_establish", names)
 
 
+class SendSidePayloadValidation(OutboundNotifications):
+    """session_route_send fails closed on payloads the recipient's
+    dispatcher would reject — the error surfaces in the TOOL RESULT
+    instead of dying receive-side where the sender can't see it."""
+
+    def _send(self, content):
+        p1, p2, p3, p4, p5 = self._patches()
+        with p1, p2, p3, p4, p5:
+            return _tools.handle_session_route_send(
+                target=PEER_ADDR, content=content
+            )
+
+    def test_content_without_type_rejected_before_publish(self):
+        # The live-incident shape: free-form dict, no registered type.
+        result = self._send({"kind": "back_channel_probe", "text": "hi"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid_payload")
+        self.assertEqual(result["error_code"], "validation_error")
+        self.assertIn("message.text", result["hint"])
+        self.assertEqual(FakeClient.published, [])
+
+    def test_unregistered_type_rejected(self):
+        result = self._send({"type": "session.message", "body": "hi"})
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid_payload")
+        self.assertEqual(result["error_code"], "unknown_type")
+        self.assertEqual(FakeClient.published, [])
+
+    def test_empty_channel_id_rejected(self):
+        # The mirror-image live-incident shape (peer sent channel_id "").
+        result = self._send(
+            {"type": "message.text", "body": "hi", "channel_id": ""}
+        )
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid_payload")
+        self.assertEqual(FakeClient.published, [])
+
+    def test_omitted_content_rejected(self):
+        p1, p2, p3, p4, p5 = self._patches()
+        with p1, p2, p3, p4, p5:
+            result = _tools.handle_session_route_send(target=PEER_ADDR)
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error"], "invalid_payload")
+
+    def test_minimal_message_text_still_sends(self):
+        # v0.2-interop minimum: type + body (dispatcher fills the rest).
+        result = self._send({"type": "message.text", "body": "hi"})
+        self.assertTrue(result["ok"], result)
+        self.assertEqual(len(FakeClient.published), 1)
+
+
 if __name__ == "__main__":
     unittest.main()
