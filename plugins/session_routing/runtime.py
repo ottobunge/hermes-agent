@@ -331,6 +331,18 @@ class SessionRoutingRuntime:
                 now - runner.last_activity_at
                 if runner.last_activity_at else None
             ),
+            # last_activity stamps on EMPTY fetches too (loop-liveness
+            # for the watchdog). These two differentiate "alive but
+            # idle" from "alive and delivering"; None = never since
+            # runner start.
+            "last_message_age_seconds": (
+                now - runner.last_message_at
+                if runner.last_message_at is not None else None
+            ),
+            "last_dispatch_age_seconds": (
+                now - runner.last_dispatch_at
+                if runner.last_dispatch_at is not None else None
+            ),
             "fetch_count": runner.fetch_count,
             "dispatch_count": runner.dispatch_count,
             "watchdog_restarts": self._watchdog_restarts,
