@@ -63,6 +63,20 @@ BACK_CHANNEL_PREFIX = "[back-channel from {peer}] "
 _ERROR_REPLY_MEMORY_CAP = 500
 
 
+def _coerce_address(value: Any) -> Optional[str]:
+    """Canonical address from an envelope from/to field, tolerating the
+    foreign dict shape (hand-rolled publishers put the address under a
+    ``peer_address`` key). Returns None when no string address is
+    recoverable — the caller then skips replying entirely."""
+    if isinstance(value, str) and value:
+        return value
+    if isinstance(value, dict):
+        peer = value.get("peer_address")
+        if isinstance(peer, str) and peer:
+            return peer
+    return None
+
+
 class BackChannelDispatcher:
     """Routes one inbound envelope; owned by the plugin runtime.
 
@@ -114,13 +128,23 @@ class BackChannelDispatcher:
         try:
             _routing.validate_envelope(envelope)
         except ValueError as e:
-            # Malformed envelope: no msg_id/from to reply to reliably —
-            # log loudly (NOT a silent drop) and ack so it can't wedge
-            # the consumer. It will never become valid on redelivery.
+            # Malformed envelope: ack so it can't wedge the consumer —
+            # it will never become valid on redelivery. Log the blob's
+            # top-level keys so the receive-side log alone identifies
+            # the foreign schema (live incident 2026-07-07: five
+            # hand-published "session.message" blobs were acked+dropped
+            # here with nothing visible to the sender), then answer
+            # once with message.error when the blob carries parseable
+            # addresses so the SENDER's gateway records the rejection.
+            keys = (
+                sorted(envelope.keys())
+                if isinstance(envelope, dict) else type(envelope).__name__
+            )
             logger.warning(
                 "session_routing dispatcher: malformed envelope on %s "
-                "dropped: %s", subject, e,
+                "dropped: %s (top-level keys=%s)", subject, e, keys,
             )
+            await self._reply_invalid_envelope(envelope, detail=str(e))
             return
 
         msg_id = envelope["msg_id"]
@@ -557,6 +581,83 @@ class BackChannelDispatcher:
             record["role"] = "implicit"
         _channels.record_msg_id(record, envelope["msg_id"])
         await client.write_channel(kv_key=kv_key, record=record)
+
+    async def _reply_invalid_envelope(
+        self,
+        envelope: Any,
+        *,
+        detail: str,
+    ) -> None:
+        """Best-effort message.error for a malformed-but-attributable blob.
+
+        A recurring failure mode is a sender publishing an invented
+        schema straight to NATS (bypassing ``session_route_send``).
+        Those blobs fail ``validate_envelope()`` and are acked+dropped,
+        which is correct — but historically the sender learned nothing.
+        When the blob still carries parseable from/to addresses (string
+        form, or the foreign dict form with a ``peer_address`` field),
+        answer exactly once with ``message.error{invalid_envelope}`` so
+        the sender's dispatcher logs the rejection.
+
+        Guards: never answer a blob whose claimed type looks like an
+        error (loop guard), require an ``id``/``msg_id`` to dedupe on
+        (bounded in-memory window), require the to-address to be ours,
+        and swallow every failure — this path must never affect acking.
+        """
+        if not isinstance(envelope, dict):
+            return
+
+        claimed_type = envelope.get("type")
+        payload = envelope.get("payload")
+        if isinstance(payload, dict) and payload.get("type"):
+            claimed_type = payload.get("type")
+        if isinstance(claimed_type, str) and "error" in claimed_type:
+            return  # loop guard: never answer an error-ish blob
+
+        blob_id = envelope.get("msg_id") or envelope.get("id")
+        if not isinstance(blob_id, str) or not blob_id:
+            return  # nothing to dedupe on — do not risk an answer loop
+        if blob_id in self._error_replied_msg_ids:
+            return
+        self._error_replied_msg_ids.append(blob_id)
+        del self._error_replied_msg_ids[:-_ERROR_REPLY_MEMORY_CAP]
+
+        peer_address = _coerce_address(envelope.get("from"))
+        my_address = _coerce_address(envelope.get("to"))
+        if not peer_address or not my_address:
+            return
+        try:
+            to_gw, my_session_key = _address.parse(my_address)
+            _address.parse(peer_address)
+        except _address.AddressError:
+            return
+        if to_gw != self._my_gateway_id:
+            return  # not addressed to us — the owning gateway answers
+
+        try:
+            async with NATSRoutingClient(servers=self._servers) as client:
+                await self._publish_payload(
+                    client=client,
+                    to_address=peer_address,
+                    from_session_key=my_session_key,
+                    payload=_protocol.build_message_error(
+                        channel_id=str(envelope.get("channel_id") or "unknown"),
+                        session_id="unknown",
+                        error_code=_protocol.ERROR_CODE_INVALID_ENVELOPE,
+                        in_reply_to=blob_id,
+                        detail=(
+                            f"not a v0.3 envelope ({detail}); publish via "
+                            "session_route_send, not hand-rolled NATS"
+                        ),
+                    ),
+                )
+        except Exception as e:  # noqa: BLE001
+            # Purely diagnostic: a failed error-reply must not turn a
+            # permanently-bad envelope into redelivery or a crash.
+            logger.warning(
+                "session_routing dispatcher: invalid_envelope reply for "
+                "%s failed: %s", blob_id, e,
+            )
 
     async def _reply_error_loop_guarded(
         self,

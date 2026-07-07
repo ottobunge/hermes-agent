@@ -175,6 +175,51 @@ class DeferredAckRunner(unittest.TestCase):
         self.assertEqual(client.ack_calls, [])
         self.assertTrue(client.fetch_calls[0]["auto_ack"])
 
+    def test_dispatch_liveness_stamps_set_on_successful_dispatch(self):
+        # last_message_at / last_dispatch_at differentiate "consumer
+        # alive but idle" from "alive and delivering" — last_activity_at
+        # alone cannot (it stamps on empty fetches for the watchdog).
+        def on_message(payload, subject, headers):
+            pass
+
+        FakeRoutingClient._queue = [_msg()]
+        runner = InboxRunner(
+            servers=SERVERS,
+            my_gateway_id="gw-me",
+            on_message=on_message,
+            poll_interval=0.01,
+            fetch_timeout=0.01,
+            auto_ack=False,
+        )
+        self.assertIsNone(runner.last_message_at)
+        self.assertIsNone(runner.last_dispatch_at)
+        p1, p2 = self._patched()
+        with p1, p2:
+            self._run_until_drained(runner)
+
+        self.assertIsNotNone(runner.last_message_at)
+        self.assertIsNotNone(runner.last_dispatch_at)
+
+    def test_raising_callback_stamps_message_but_not_dispatch(self):
+        def on_message(payload, subject, headers):
+            raise RuntimeError("handler crashed")
+
+        FakeRoutingClient._queue = [_msg()]
+        runner = InboxRunner(
+            servers=SERVERS,
+            my_gateway_id="gw-me",
+            on_message=on_message,
+            poll_interval=0.01,
+            fetch_timeout=0.01,
+            auto_ack=False,
+        )
+        p1, p2 = self._patched()
+        with p1, p2:
+            self._run_until_drained(runner)
+
+        self.assertIsNotNone(runner.last_message_at)   # message was pulled
+        self.assertIsNone(runner.last_dispatch_at)     # but never delivered
+
 
 if __name__ == "__main__":
     unittest.main()

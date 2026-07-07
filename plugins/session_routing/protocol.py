@@ -67,6 +67,9 @@ REGISTERED_TYPES = HANDSHAKE_TYPES | MESSAGE_TYPES | UNSUPPORTED_TYPES
 ERROR_CODE_UNKNOWN_TYPE = "unknown_type"
 ERROR_CODE_UNSUPPORTED_TYPE = "unsupported_type"
 ERROR_CODE_VALIDATION = "validation_error"
+# The outer ENVELOPE (not the payload) failed routing.validate_envelope
+# — e.g. a hand-rolled publish that bypassed session_route_send.
+ERROR_CODE_INVALID_ENVELOPE = "invalid_envelope"
 
 _APP_NAMESPACE_RE = re.compile(r"^app\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-.]+$")
 
