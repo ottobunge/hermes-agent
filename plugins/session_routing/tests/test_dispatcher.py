@@ -165,12 +165,17 @@ class MessageText(DispatcherHarness):
         self.assertIsNotNone(record)
         self.assertIn(envelope["msg_id"], record["recent_msg_ids"])
 
-    def test_enqueue_failure_is_logged_not_raised_and_no_ack_delivery(self):
+    def test_enqueue_failure_answers_delivery_failed_no_ack_delivery(self):
         self.enqueue_ok = False
         envelope = _envelope(_text_payload())
         self._handle(envelope)  # must not raise
         self.assertEqual(self.enqueued, [])
-        self.assertEqual(self._published_types(), [])
+        # No ack_delivery (nothing was delivered) — instead the sender
+        # learns the message was deduped-but-lost.
+        self.assertEqual(self._published_types(), ["message.error"])
+        error = FakeClient.published[0]["envelope"]["payload"]
+        self.assertEqual(error["error_code"], "delivery_failed")
+        self.assertEqual(error["in_reply_to"], envelope["msg_id"])
 
 
 class AddressingAndValidation(DispatcherHarness):
@@ -182,12 +187,33 @@ class AddressingAndValidation(DispatcherHarness):
         self.assertEqual(self.enqueued, [])
         self.assertEqual(FakeClient.published, [])
 
-    def test_unknown_session_dropped(self):
+    def test_unknown_session_answers_no_live_session(self):
         envelope = _envelope(
             _text_payload(), to_address=f"{MY_GW}/agent:unknown:session"
         )
         self._handle(envelope)
         self.assertEqual(self.enqueued, [])
+        self.assertEqual(self._published_types(), ["message.error"])
+        error = FakeClient.published[0]["envelope"]["payload"]
+        self.assertEqual(error["error_code"], "no_live_session")
+        self.assertEqual(error["in_reply_to"], envelope["msg_id"])
+        # Redelivery / re-send of the SAME envelope → answered once.
+        self._handle(envelope)
+        self.assertEqual(self._published_types(), ["message.error"])
+
+    def test_message_error_for_unknown_session_not_answered(self):
+        # Loop guard: even a dead-session drop never answers an
+        # inbound message.error with another message.error.
+        payload = _protocol.build_message_error(
+            channel_id=f"{PEER_SID}:deadbeef",
+            session_id=PEER_SID,
+            error_code="no_live_session",
+            in_reply_to="some-msg",
+        )
+        envelope = _envelope(
+            payload, to_address=f"{MY_GW}/agent:unknown:session"
+        )
+        self._handle(envelope)
         self.assertEqual(FakeClient.published, [])
 
     def test_malformed_envelope_does_not_raise(self):
@@ -240,6 +266,18 @@ class AddressingAndValidation(DispatcherHarness):
         # But deduped: msg_id landed in the channel window.
         record = self._local_record()
         self.assertIn(envelope["msg_id"], record["recent_msg_ids"])
+        # And user-visible: the peer's rejection is mirrored as a
+        # platform notification, not buried in errors.log.
+        self.assertEqual(len(self.notifications), 1)
+        session_key, text, kind = self.notifications[0]
+        self.assertEqual(session_key, MY_SK)
+        self.assertEqual(kind, "back_channel_error")
+        self.assertIn("unknown_type", text)
+        self.assertIn("peer complained", text)
+        self.assertIn(PEER_ADDR, text)
+        # Redelivery notifies exactly once (dedupe wall).
+        self._handle(envelope)
+        self.assertEqual(len(self.notifications), 1)
 
     def test_delegate_task_returns_unsupported_type(self):
         payload = {

@@ -70,6 +70,13 @@ ERROR_CODE_VALIDATION = "validation_error"
 # The outer ENVELOPE (not the payload) failed routing.validate_envelope
 # — e.g. a hand-rolled publish that bypassed session_route_send.
 ERROR_CODE_INVALID_ENVELOPE = "invalid_envelope"
+# Envelope + payload valid, but the addressed session_key is not live
+# on the recipient gateway (ended in flight, or presence was stale at
+# send time). The message was acked and will NOT be injected.
+ERROR_CODE_NO_LIVE_SESSION = "no_live_session"
+# The session is live but the synthetic-turn enqueue failed; the
+# message was durably deduped and will NOT be redelivered or injected.
+ERROR_CODE_DELIVERY_FAILED = "delivery_failed"
 
 _APP_NAMESPACE_RE = re.compile(r"^app\.[A-Za-z0-9_\-]+\.[A-Za-z0-9_\-.]+$")
 

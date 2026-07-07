@@ -185,11 +185,24 @@ class BackChannelDispatcher:
         if not local_session_id:
             # Session not live on this gateway. KV presence said
             # otherwise at send time, or the session ended in flight.
-            # Log + ack: redelivery cannot resurrect the session.
+            # Ack (redelivery cannot resurrect the session) — but tell
+            # the sender: a peer that keeps publishing into a dead
+            # target otherwise sees nothing but broker acks (loop
+            # guards inside never answer an inbound message.error).
             logger.info(
                 "session_routing dispatcher: no live session %r for "
                 "envelope %s (%s) — dropping",
                 to_session_key, msg_id, payload.get("type"),
+            )
+            await self._reply_error_loop_guarded(
+                envelope=envelope,
+                to_session_key=to_session_key,
+                peer_address=peer_address,
+                error_code=_protocol.ERROR_CODE_NO_LIVE_SESSION,
+                detail=(
+                    f"session {to_session_key!r} is not live on "
+                    f"{self._my_gateway_id}; message acked, not injected"
+                ),
             )
             return
 
@@ -241,9 +254,13 @@ class BackChannelDispatcher:
                     peer_address=peer_address,
                 )
             elif ptype == "message.error":
-                # Peer-to-peer protocol error: structured log ONLY.
-                # Never injected as a user turn, never answered with
-                # another message.error (loop guard).
+                # Peer-to-peer protocol error: never injected as a user
+                # turn, never answered with another message.error (loop
+                # guard). Logged AND mirrored as a user-visible platform
+                # notification — a WARNING alone leaves the sending
+                # agent believing the peer went silent (live incident
+                # 2026-07-07: hours of validation_error replies landed
+                # in errors.log while the sender kept re-probing).
                 logger.warning(
                     "session_routing dispatcher: message.error from %s on "
                     "%s: error_code=%s detail=%s in_reply_to=%s",
@@ -254,6 +271,20 @@ class BackChannelDispatcher:
                 await self._record_seen(client, kv_key, record, envelope,
                                         channel_id, local_session_id,
                                         peer_address)
+                detail = payload.get("detail") or ""
+                await self._notify(
+                    to_session_key,
+                    (
+                        f"⚠️ back-channel error from {peer_address}: "
+                        f"{payload.get('error_code')}"
+                        + (f" — {detail}" if detail else "")
+                        + (
+                            f" (in_reply_to={payload.get('in_reply_to')})"
+                            if payload.get("in_reply_to") else ""
+                        )
+                    ),
+                    "back_channel_error",
+                )
             elif ptype == "message.ack_delivery":
                 logger.debug(
                     "session_routing dispatcher: delivery ack from %s for %s",
@@ -494,11 +525,29 @@ class BackChannelDispatcher:
             # KV already recorded the msg_id; raising would redeliver
             # into the same dedupe wall. Log loudly instead. No user
             # notification either: "received" would be a lie when the
-            # turn was never injected.
+            # turn was never injected. The SENDER does get told —
+            # without the message.error below, a permanently-lost
+            # message looks identical to a delivered one (broker ack
+            # only) from their side.
             logger.warning(
                 "session_routing dispatcher: enqueue failed for %s "
                 "(msg_id=%s) — message recorded but not injected",
                 to_session_key, msg_id,
+            )
+            await self._publish_payload(
+                client=client,
+                to_address=peer_address,
+                from_session_key=to_session_key,
+                payload=_protocol.build_message_error(
+                    channel_id=channel_id,
+                    session_id=local_session_id,
+                    error_code=_protocol.ERROR_CODE_DELIVERY_FAILED,
+                    in_reply_to=msg_id,
+                    detail=(
+                        "enqueue into the target session failed; the "
+                        "message was deduped and will not be injected"
+                    ),
+                ),
             )
             return
 
