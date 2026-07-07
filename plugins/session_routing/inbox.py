@@ -26,13 +26,24 @@ Design contract:
     keeps the dependency direction one-way (inbox → callback, never
     callback → inbox).
 
-Versioning: v0.1.0 (Phase 1).
+  - Activity tracking: ``self.last_activity_at`` is set on every
+    successful fetch AND on every dispatched message. Operators
+    (and the runtime watchdog) use ``is_healthy()`` to detect
+    silent-death: a runner whose ``last_activity_at`` is older than
+    the threshold is considered dead even if the task object is
+    non-None. This catches the failure mode where the consumer task
+    is "running" but no longer pulling (broker reconnection wedged,
+    network partition, etc.). Without this, a dead runner would
+    look healthy to ``is_running`` until gateway restart.
+
+Versioning: v0.1.0 (Phase 1), watchdog + activity tracking in v0.3.1.
 """
 
 from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
 from plugins.session_routing.allow import effective_allow_list
@@ -48,6 +59,12 @@ DEFAULT_POLL_INTERVAL = 1.0
 DEFAULT_EMPTY_BACKOFF_MAX = 30.0
 DEFAULT_BROKER_RETRY_DELAY = 5.0
 DEFAULT_FETCH_TIMEOUT = 1.0
+
+# Watchdog threshold: a runner whose last_activity_at is older than this
+# is considered silently-dead even if the task object is non-None. Set
+# high enough to tolerate legitimate broker latency spikes during gateway
+# bring-up; set low enough to catch real failures quickly.
+DEFAULT_HEALTH_THRESHOLD_SECONDS = 60.0
 
 
 # A callback receives the parsed envelope, the broker subject, and the
@@ -78,6 +95,7 @@ class InboxRunner:
         empty_backoff_max: float = DEFAULT_EMPTY_BACKOFF_MAX,
         broker_retry_delay: float = DEFAULT_BROKER_RETRY_DELAY,
         fetch_timeout: float = DEFAULT_FETCH_TIMEOUT,
+        health_threshold_seconds: float = DEFAULT_HEALTH_THRESHOLD_SECONDS,
         auto_ack: bool = True,
     ) -> None:
         if not servers:
@@ -102,9 +120,66 @@ class InboxRunner:
         # makes the redelivery idempotent).
         self._auto_ack = auto_ack
 
+        # Activity tracking — public read-only view of "is the consumer
+        # actually pulling and dispatching". Both fields are wall-clock
+        # seconds (time.monotonic equivalent via time.time). Set on every
+        # successful fetch AND on every dispatched message. Watchdog
+        # consults ``last_activity_at`` to detect silent death.
+        self._last_activity_at: float = time.monotonic()
+        self._fetch_count: int = 0
+        self._dispatch_count: int = 0
+        self._health_threshold = health_threshold_seconds
+
+        # Lifecycle
         self._stop_event = asyncio.Event()
         self._task: Optional[asyncio.Task[None]] = None
         self._current_allow: List[str] = []
+
+    # ------------------------------------------------------------------
+    # Activity tracking (public surface for watchdog + status tool)
+    # ------------------------------------------------------------------
+
+    @property
+    def last_activity_at(self) -> float:
+        """Monotonic timestamp of the most recent successful fetch or
+        dispatch. Used by the watchdog to detect silent death."""
+        return self._last_activity_at
+
+    @property
+    def fetch_count(self) -> int:
+        """Number of successful broker fetches since this runner was
+        started. Useful as a health sanity-check — a runner that has
+        never fetched is either freshly-started or wedged."""
+        return self._fetch_count
+
+    @property
+    def dispatch_count(self) -> int:
+        """Number of messages successfully dispatched (callback
+        returned without raising) since this runner was started."""
+        return self._dispatch_count
+
+    def is_healthy(self, *, now: Optional[float] = None) -> bool:
+        """Return True iff the runner has shown activity recently.
+
+        "Recently" = within ``health_threshold_seconds`` of ``now`` (or
+        the current monotonic clock if ``now`` is omitted).
+
+        This is the watchdog's primary signal. A runner whose
+        ``is_running`` is True (task object alive) but whose
+        ``last_activity_at`` is stale is a silent-death case: the
+        task is "running" but not actually doing anything useful
+        (broker reconnection wedged, network partition, etc.).
+        """
+        if not self.is_running:
+            return False
+        current = now if now is not None else time.monotonic()
+        age = current - self._last_activity_at
+        return age <= self._health_threshold
+
+    def _record_activity(self) -> None:
+        """Stamp the activity clock. Called on every successful fetch
+        and on every successful dispatch."""
+        self._last_activity_at = time.monotonic()
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -121,6 +196,9 @@ class InboxRunner:
         self._task = asyncio.create_task(
             self._run(), name=f"session-routing-inbox-{self._my_gateway_id}"
         )
+        # Initial activity stamp so a freshly-started runner doesn't
+        # immediately look unhealthy while it's still bootstrapping.
+        self._record_activity()
         logger.info(
             "session_routing inbox: started for %s (servers=%s)",
             self._my_gateway_id,
@@ -205,6 +283,15 @@ class InboxRunner:
                             await self._sleep_or_stop(self._broker_retry_delay)
                             break
 
+                        # Successful fetch (even if it returned empty).
+                        # Empty results still count as "the broker is
+                        # alive and we're connected" — without this
+                        # stamp, a quiet inbox would let
+                        # ``last_activity_at`` go stale and trip the
+                        # watchdog even when the runner is healthy.
+                        self._record_activity()
+                        self._fetch_count += 1
+
                         message = result.get("message") if result else None
                         if not message:
                             # Empty queue. Reset exponential backoff, sleep
@@ -217,6 +304,15 @@ class InboxRunner:
 
                         empty_delay = self._poll_interval
                         dispatched_ok = await self._dispatch(message)
+                        if dispatched_ok:
+                            # Stamp activity on successful dispatch too.
+                            # This is the operator-visible "we are
+                            # actually delivering messages" signal —
+                            # a runner that fetches but never
+                            # successfully dispatches (callback keeps
+                            # raising) is also broken.
+                            self._record_activity()
+                            self._dispatch_count += 1
                         if not self._auto_ack:
                             # Ack order (deferred mode): the callback has
                             # validated/deduped/enqueued durably — only
