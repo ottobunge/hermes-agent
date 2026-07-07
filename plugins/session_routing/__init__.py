@@ -68,6 +68,12 @@ _TOOLS = (
         "📋",
     ),
     (
+        "session_inbox_status",
+        _tools.SESSION_INBOX_STATUS_SCHEMA,
+        _tools.handle_session_inbox_status,
+        "💓",
+    ),
+    (
         "session_establish",
         _tools.SESSION_ESTABLISH_SCHEMA,
         _tools.handle_session_establish,

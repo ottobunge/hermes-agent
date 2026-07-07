@@ -31,12 +31,15 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-from typing import Any, List, Optional
+from typing import Any, Dict, List, Optional
 
 from plugins.session_routing import address as _address
 from plugins.session_routing import presence as _presence
 from plugins.session_routing.dispatcher import BackChannelDispatcher
-from plugins.session_routing.inbox import InboxRunner
+from plugins.session_routing.inbox import (
+    DEFAULT_HEALTH_THRESHOLD_SECONDS,
+    InboxRunner,
+)
 from plugins.session_routing.nats_client import DEFAULT_HEARTBEAT_SECONDS
 
 logger = logging.getLogger(__name__)
@@ -75,6 +78,16 @@ class SessionRoutingRuntime:
         self._gateway: Any = None
         self._runner: Optional[InboxRunner] = None
         self._heartbeat_task: Optional[asyncio.Task] = None
+        # Watchdog: detects silent death of the inbox runner (task object
+        # alive but no activity — broker reconnect wedged, network
+        # partition, etc.) and respawns it with exponential backoff.
+        # The previous failure mode (2026-07-07 02:41 CEST) was exactly
+        # this: runner stopped pulling, ``is_running`` stayed True, no
+        # error logged, 24+ minutes of bilateral coordination lost
+        # before the operator noticed.
+        self._watchdog_task: Optional[asyncio.Task] = None
+        self._watchdog_restarts: int = 0
+        self._watchdog_last_check_at: float = 0.0
         self._cleanup_tasks: set = set()
         self._servers: List[str] = []
         self._gateway_id: str = ""
@@ -141,6 +154,10 @@ class SessionRoutingRuntime:
             self._heartbeat_loop(),
             name=f"session-routing-presence-{self._gateway_id}",
         )
+        self._watchdog_task = asyncio.create_task(
+            self._watchdog_loop(),
+            name=f"session-routing-watchdog-{self._gateway_id}",
+        )
         logger.info(
             "session_routing runtime: started (gateway_id=%s, servers=%s)",
             self._gateway_id, self._servers,
@@ -154,6 +171,13 @@ class SessionRoutingRuntime:
         return self._stop()
 
     async def _stop(self) -> None:
+        if self._watchdog_task is not None:
+            self._watchdog_task.cancel()
+            try:
+                await self._watchdog_task
+            except (asyncio.CancelledError, Exception):  # noqa: BLE001
+                pass
+            self._watchdog_task = None
         if self._heartbeat_task is not None:
             self._heartbeat_task.cancel()
             try:
@@ -168,6 +192,154 @@ class SessionRoutingRuntime:
                 logger.warning("session_routing runtime: inbox stop failed: %s", e)
             self._runner = None
         logger.info("session_routing runtime: stopped")
+
+    # ------------------------------------------------------------------
+    # Watchdog
+    # ------------------------------------------------------------------
+
+    async def _watchdog_loop(self) -> None:
+        """Periodically check the inbox runner's health. If the runner
+        has gone silent (no activity within ``health_threshold`` and
+        the task is "running"), respawn it.
+
+        Why this exists: ``InboxRunner.is_running`` returns True when
+        the task object is alive, but a wedged broker reconnect (or
+        similar) can leave the task alive while it stops actually
+        pulling. The previous failure mode (2026-07-07 02:41 CEST) was
+        exactly this — silent death, no error, lost coordination. The
+        watchdog respawns the runner with exponential backoff so a
+        persistently-broken broker doesn't hot-loop the respawn.
+        """
+        import time as _time
+
+        check_interval = max(5.0, DEFAULT_HEALTH_THRESHOLD_SECONDS / 4.0)
+        backoff = 1.0
+        max_backoff = 60.0
+        next_allowed_restart = 0.0
+        while True:
+            try:
+                await asyncio.sleep(check_interval)
+            except asyncio.CancelledError:
+                raise
+            self._watchdog_last_check_at = _time.monotonic()
+            runner = self._runner
+            if runner is None:
+                continue
+            if runner.is_healthy():
+                # Healthy — reset backoff, keep watching.
+                backoff = 1.0
+                continue
+            # Unhealthy. The runner task is "running" but the
+            # activity clock is stale, OR the task is dead. Either
+            # way, respawn it — but only if we're past the
+            # backoff window (so a broker that's permanently down
+            # doesn't burn the respawn budget).
+            now = _time.monotonic()
+            if now < next_allowed_restart:
+                logger.debug(
+                    "session_routing watchdog: unhealthy but backoff window "
+                    "(%.1fs left)",
+                    next_allowed_restart - now,
+                )
+                continue
+            logger.warning(
+                "session_routing watchdog: inbox runner unhealthy "
+                "(is_running=%s, last_activity=%.1fs ago, fetches=%d, "
+                "dispatches=%d) — respawning",
+                runner.is_running,
+                now - runner.last_activity_at,
+                runner.fetch_count,
+                runner.dispatch_count,
+            )
+            self._watchdog_restarts += 1
+            try:
+                await runner.stop(timeout=5.0)
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "session_routing watchdog: stop() raised %r — continuing",
+                    e,
+                )
+            self._runner = InboxRunner(
+                servers=self._servers,
+                my_gateway_id=self._gateway_id,
+                on_message=self._rebuild_dispatcher_for_restart,
+                auto_ack=False,
+            )
+            self._runner.start()
+            next_allowed_restart = now + backoff
+            backoff = min(backoff * 2.0, max_backoff)
+            logger.info(
+                "session_routing watchdog: respawned runner (total_restarts=%d, "
+                "next backoff=%.1fs)",
+                self._watchdog_restarts,
+                backoff,
+            )
+
+    def _rebuild_dispatcher_for_restart(
+        self,
+        payload: Any,
+        subject: str,
+        headers: Dict[str, str],
+    ) -> Any:
+        """Build a fresh dispatcher + invoke handle on respawn.
+
+        We can't keep the old dispatcher's KV client open across
+        respawns (the NATS connection it owns is gone), so the
+        watchdog constructs a new one each time. The same
+        collaborators (resolve_session_id, enqueue_event,
+        publish_notification) carry over.
+        """
+        dispatcher = BackChannelDispatcher(
+            servers=self._servers,
+            my_gateway_id=self._gateway_id,
+            resolve_session_id=self._resolve_session_id,
+            enqueue_event=self._enqueue_event,
+            publish_notification=self._publish_notification,
+        )
+        return dispatcher.handle(
+            envelope=payload,
+            subject=subject,
+            headers=headers,
+        )
+
+    # ------------------------------------------------------------------
+    # Operator visibility
+    # ------------------------------------------------------------------
+
+    def inbox_status(self) -> Dict[str, Any]:
+        """Return a status snapshot for ``session_inbox_status`` tool.
+
+        The model-facing tool surfaces this to the operator so
+        silent-death cases are visible immediately. Includes the
+        watchdog's restart count and last-check timestamp.
+        """
+        import time as _time
+
+        runner = self._runner
+        if runner is None:
+            return {
+                "started": False,
+                "gateway_id": self._gateway_id,
+            }
+        now = _time.monotonic()
+        return {
+            "started": True,
+            "gateway_id": self._gateway_id,
+            "is_running": runner.is_running,
+            "is_healthy": runner.is_healthy(now=now),
+            "last_activity_age_seconds": (
+                now - runner.last_activity_at
+                if runner.last_activity_at else None
+            ),
+            "fetch_count": runner.fetch_count,
+            "dispatch_count": runner.dispatch_count,
+            "watchdog_restarts": self._watchdog_restarts,
+            "watchdog_last_check_age_seconds": (
+                now - self._watchdog_last_check_at
+                if self._watchdog_last_check_at else None
+            ),
+            "consumer_name": f"inbox-{self._gateway_id}",
+        }
 
     # -- on_session_finalize ---------------------------------------------------
 
