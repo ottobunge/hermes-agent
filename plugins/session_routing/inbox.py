@@ -126,6 +126,15 @@ class InboxRunner:
         # successful fetch AND on every dispatched message. Watchdog
         # consults ``last_activity_at`` to detect silent death.
         self._last_activity_at: float = time.monotonic()
+        # Dispatch-liveness, tracked separately from loop-liveness:
+        # ``last_activity_at`` stamps on EVERY successful fetch (including
+        # empty ones — that is correct for the watchdog: the loop is
+        # alive), so on its own it cannot distinguish "consumer alive but
+        # idle" from "consumer alive and delivering". These two stamps
+        # stay None until the corresponding event has happened at least
+        # once, so the status tool can expose the difference.
+        self._last_message_at: Optional[float] = None   # non-empty fetch
+        self._last_dispatch_at: Optional[float] = None  # callback returned OK
         self._fetch_count: int = 0
         self._dispatch_count: int = 0
         self._health_threshold = health_threshold_seconds
@@ -144,6 +153,19 @@ class InboxRunner:
         """Monotonic timestamp of the most recent successful fetch or
         dispatch. Used by the watchdog to detect silent death."""
         return self._last_activity_at
+
+    @property
+    def last_message_at(self) -> Optional[float]:
+        """Monotonic timestamp of the most recent NON-EMPTY fetch, or
+        None if this runner has never pulled a message. Unlike
+        ``last_activity_at`` this does not advance on empty polls."""
+        return self._last_message_at
+
+    @property
+    def last_dispatch_at(self) -> Optional[float]:
+        """Monotonic timestamp of the most recent successful dispatch
+        (callback returned without raising), or None if never."""
+        return self._last_dispatch_at
 
     @property
     def fetch_count(self) -> int:
@@ -303,6 +325,7 @@ class InboxRunner:
                             continue
 
                         empty_delay = self._poll_interval
+                        self._last_message_at = time.monotonic()
                         dispatched_ok = await self._dispatch(message)
                         if dispatched_ok:
                             # Stamp activity on successful dispatch too.
@@ -312,6 +335,7 @@ class InboxRunner:
                             # successfully dispatches (callback keeps
                             # raising) is also broken.
                             self._record_activity()
+                            self._last_dispatch_at = time.monotonic()
                             self._dispatch_count += 1
                         if not self._auto_ack:
                             # Ack order (deferred mode): the callback has

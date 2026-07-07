@@ -578,5 +578,70 @@ class Notifications(DispatcherHarness):
         self.assertEqual(self.notifications, [])
 
 
+class InvalidEnvelopeReply(DispatcherHarness):
+    """Malformed (non-v0.3) blobs stay acked+dropped, but when the blob
+    carries parseable addresses the claimed sender gets exactly one
+    message.error{invalid_envelope} (live incident 2026-07-07: five
+    hand-published "session.message" blobs were dropped with nothing
+    visible sender-side)."""
+
+    def _foreign_blob(self, blob_id="foreign-1"):
+        # The hand-rolled schema observed on the broker (stream seq
+        # 220): dict from/to carrying peer_address, id instead of
+        # msg_id, unregistered type.
+        return {
+            "id": blob_id,
+            "type": "session.message",
+            "from": {"gateway_id": PEER_GW, "peer_address": PEER_ADDR},
+            "to": {"peer_address": MY_ADDR},
+            "body": {"type": "text", "text": "hello"},
+        }
+
+    def test_foreign_blob_answered_with_invalid_envelope(self):
+        self._handle(self._foreign_blob())
+        self.assertEqual(self.enqueued, [])
+        self.assertEqual(self._published_types(), ["message.error"])
+        published = FakeClient.published[0]["envelope"]
+        self.assertEqual(published["to"], PEER_ADDR)
+        error = published["payload"]
+        self.assertEqual(error["error_code"], "invalid_envelope")
+        self.assertEqual(error["in_reply_to"], "foreign-1")
+
+    def test_string_addresses_also_answered(self):
+        blob = self._foreign_blob("foreign-str")
+        blob["from"] = PEER_ADDR
+        blob["to"] = MY_ADDR
+        self._handle(blob)
+        self.assertEqual(self._published_types(), ["message.error"])
+
+    def test_redelivered_blob_answered_exactly_once(self):
+        blob = self._foreign_blob("foreign-dup")
+        self._handle(blob)
+        self._handle(blob)
+        self.assertEqual(self._published_types(), ["message.error"])
+
+    def test_blob_without_id_not_answered(self):
+        blob = self._foreign_blob()
+        del blob["id"]
+        self._handle(blob)
+        self.assertEqual(FakeClient.published, [])
+
+    def test_errorish_blob_never_answered(self):
+        blob = self._foreign_blob("foreign-err")
+        blob["type"] = "session.error"
+        self._handle(blob)
+        self.assertEqual(FakeClient.published, [])
+
+    def test_blob_addressed_to_other_gateway_not_answered(self):
+        blob = self._foreign_blob("foreign-other")
+        blob["to"] = {"peer_address": f"gw-elsewhere/{MY_SK}"}
+        self._handle(blob)
+        self.assertEqual(FakeClient.published, [])
+
+    def test_blob_without_addresses_not_answered(self):
+        self._handle({"not": "an envelope", "msg_id": "x-1"})
+        self.assertEqual(FakeClient.published, [])
+
+
 if __name__ == "__main__":
     unittest.main()
