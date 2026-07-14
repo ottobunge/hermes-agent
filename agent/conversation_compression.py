@@ -45,11 +45,95 @@ logger = logging.getLogger(__name__)
 # status as ``kind="compacting"`` (tui_gateway/server.py::_status_update), so
 # drivers like the desktop app can show an explicit "Summarizing…" indicator
 # instead of the transcript appearing to silently reset. Keep the marker phrase
-# intact if you reword COMPACTION_STATUS.
+# intact if you reword the start message.
 COMPACTION_STATUS_MARKER = "Compacting context"
+# Plain-text fallback. Tests in tests/gateway/test_telegram_noise_filter.py
+# assert this exact literal is suppressed on chat surfaces — keep it in
+# sync with that test (it's a regression guard against the gateway
+# accidentally leaking operational noise). The rich-statistics message
+# used at runtime is built by ``format_compression_status_start`` /
+# ``format_compression_status_end`` below.
 COMPACTION_STATUS = (
     f"🗜️ {COMPACTION_STATUS_MARKER} — summarizing earlier conversation so I can continue..."
 )
+
+
+def _fmt_tokens(n):
+    """Compact token count string. >=10k → "Nk", <1k → "N"."""
+    try:
+        n = int(n or 0)
+    except (TypeError, ValueError):
+        return "?"
+    if n >= 10_000:
+        return f"{n // 1000}k"
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return f"{n}"
+
+
+def format_compression_status_start(
+    *,
+    run_count: int,
+    approx_tokens=None,
+    context_length=None,
+    threshold_tokens=None,
+    is_auto: bool = True,
+):
+    """Build the *start* status message with token statistics.
+
+    The literal ``COMPACTION_STATUS_MARKER`` is included so the desktop
+    "Summarizing…" indicator still matches (see tests/tui_gateway/
+    test_compaction_status.py). Token counts use the compact ``Nk`` /
+    ``k`` formatter so the line fits Telegram's 4096-char budget on
+    long sessions.
+
+    Args:
+        run_count: 1-based compression count (first run = 1).
+        approx_tokens: Pre-compression token estimate (best-effort).
+        context_length: Model's full context window, if known.
+        threshold_tokens: Trigger threshold for the compressor.
+        is_auto: True when called by the auto-compression loop, False
+            when triggered by the manual ``/compress`` slash command.
+    """
+    trigger = "Auto-" if is_auto else "Manual "
+    parts = [f"🗜️ {trigger}{COMPACTION_STATUS_MARKER} (run #{run_count})"]
+    stats = []
+    if approx_tokens:
+        stats.append(f"~{_fmt_tokens(approx_tokens)} tokens")
+    if context_length:
+        stats.append(f"{_fmt_tokens(context_length)} context")
+    if threshold_tokens:
+        stats.append(f"trigger {_fmt_tokens(threshold_tokens)}")
+    if stats:
+        parts.append(f"({', '.join(stats)})")
+    parts.append("— summarizing earlier conversation so I can continue…")
+    return " ".join(parts)
+
+
+def format_compression_status_end(
+    *,
+    run_count: int,
+    n_messages_in: int,
+    n_messages_out: int,
+    tokens_in=None,
+    tokens_out=None,
+    saved_estimate=None,
+    savings_pct=None,
+):
+    """Build the *post-compression* status message with token savings.
+
+    Surfaced right before ``compress()`` returns. The checkmark glyph
+    keeps the start/end pair visually paired (🗜️ in, ✅ out).
+    """
+    parts = [f"✅ Context compressed (run #{run_count})"]
+    msg_delta = f"{n_messages_in}→{n_messages_out} msgs"
+    if tokens_in is not None and tokens_out is not None:
+        msg_delta += f", {_fmt_tokens(tokens_in)}→{_fmt_tokens(tokens_out)} tokens"
+    parts.append(f"— {msg_delta}.")
+    if saved_estimate is not None and saved_estimate > 0:
+        pct_str = f"{savings_pct:.0f}%" if savings_pct is not None else ""
+        parts.append(f"Saved ~{_fmt_tokens(saved_estimate)}{(' (' + pct_str + ')') if pct_str else ''}.")
+    return " ".join(parts)
 
 
 def _compression_lock_holder(agent: Any) -> str:
@@ -513,7 +597,13 @@ def compress_context(
         f"{approx_tokens:,}" if approx_tokens else "unknown", agent.model,
         focus_topic,
     )
-    agent._emit_status(COMPACTION_STATUS)
+    agent._emit_status(format_compression_status_start(
+        run_count=getattr(agent.context_compressor, "compression_count", 0) + 1,
+        approx_tokens=approx_tokens,
+        context_length=getattr(agent.context_compressor, "context_length", 0) or None,
+        threshold_tokens=getattr(agent.context_compressor, "threshold_tokens", 0) or None,
+        is_auto=True,
+    ))
 
     # ── Compression lock ────────────────────────────────────────────────
     # Atomic, state.db-backed lock per session_id.  Without this, two
@@ -672,6 +762,43 @@ def compress_context(
             return messages, _existing_sp
         finally:
             _release_lock()
+
+    # ── End-of-compression status ─────────────────────────────────────
+    # Emit a success message with token savings so the user sees the
+    # 📥→📤 pair on chat surfaces (no more "looks hang then quacked"
+    # when the auto-compressor runs).  Stats come from the compressor's
+    # own bookkeeping; if any field is missing (older compressor
+    # subclass, plugin engine) we silently degrade to the bare-minimum
+    # form so the message still ships.
+    try:
+        from agent.context_compressor import estimate_messages_tokens_rough
+
+        _compressor = agent.context_compressor
+        _post_tokens = estimate_messages_tokens_rough(compressed)
+        _start_tokens = approx_tokens or _post_tokens
+        _saved = (
+            max(0, int(_start_tokens - _post_tokens))
+            if (_start_tokens is not None and _post_tokens is not None)
+            else None
+        )
+        _savings_pct = (
+            (_saved / _start_tokens * 100)
+            if (_saved is not None and _start_tokens)
+            else None
+        )
+        agent._emit_status(format_compression_status_end(
+            run_count=getattr(_compressor, "compression_count", 1),
+            n_messages_in=len(messages),
+            n_messages_out=len(compressed),
+            tokens_in=_start_tokens,
+            tokens_out=_post_tokens,
+            saved_estimate=_saved,
+            savings_pct=_savings_pct,
+        ))
+    except Exception:
+        # End-of-compression status is best-effort; never block the
+        # session-rotation that follows on the actual return value.
+        logger.debug("end-of-compression status emit failed", exc_info=True)
 
     try:
         summary_error = getattr(agent.context_compressor, "_last_summary_error", None)
@@ -1042,7 +1169,13 @@ def _compress_context_via_codex_app_server(
         f"{approx_tokens:,}" if approx_tokens else "unknown",
     )
     try:
-        agent._emit_status(COMPACTION_STATUS)
+        agent._emit_status(format_compression_status_start(
+            run_count=getattr(agent.context_compressor, "compression_count", 0) + 1,
+            approx_tokens=approx_tokens,
+            context_length=getattr(agent.context_compressor, "context_length", 0) or None,
+            threshold_tokens=getattr(agent.context_compressor, "threshold_tokens", 0) or None,
+            is_auto=True,
+        ))
     except Exception:
         pass
 
