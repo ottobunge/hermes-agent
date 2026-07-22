@@ -3229,9 +3229,11 @@ def _apply_model_switch(
         is_global_flag = parsed_flags.is_global
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        force_model = parsed_flags.is_force
     else:
         model_input, explicit_provider, is_global_flag, _force_refresh, is_session = parsed_flags
         one_turn = False
+        force_model = False
     if is_global_flag and one_turn:
         raise ValueError("/model --once cannot be combined with --global")
     persist_global = (
@@ -3299,6 +3301,7 @@ def _apply_model_switch(
         explicit_provider=explicit_provider,
         user_providers=user_provs,
         custom_providers=custom_provs,
+        force=force_model,
     )
     if not result.success:
         raise ValueError(result.error_message or "model switch failed")

@@ -1462,7 +1462,7 @@ class GatewaySlashCommandsMixin:
                 self, "_resolve_profile_home_for_source"
             )(source)
 
-        # Parse --provider, --global, --session, --once, and --refresh flags
+        # Parse --provider, --global, --session, --once, --refresh, and --force flags
         parsed_flags = parse_model_flags_detailed(raw_args)
         model_input = parsed_flags.model_input
         explicit_provider = parsed_flags.explicit_provider
@@ -1470,6 +1470,7 @@ class GatewaySlashCommandsMixin:
         force_refresh = parsed_flags.force_refresh
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        force_model = parsed_flags.is_force
         if is_global_flag and one_turn:
             return "❌ /model --once cannot be combined with --global"
         if one_turn and not model_input and not explicit_provider:
@@ -1596,6 +1597,7 @@ class GatewaySlashCommandsMixin:
                             explicit_provider=provider_slug,
                             user_providers=user_provs,
                             custom_providers=custom_provs,
+                            force=force_model,
                         )
                         if not result.success:
                             return t("gateway.model.error_prefix", error=result.error_message)
@@ -1877,6 +1879,7 @@ class GatewaySlashCommandsMixin:
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            force=force_model,
         )
 
         if not result.success:

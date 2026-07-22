@@ -8277,7 +8277,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         parts = cmd_original.split(None, 1)  # split off '/model'
         raw_args = parts[1].strip() if len(parts) > 1 else ""
 
-        # Parse --provider, --global, --session, --once, and --refresh flags
+        # Parse --provider, --global, --session, --once, --refresh, and --force flags
         parsed_flags = parse_model_flags_detailed(raw_args)
         model_input = parsed_flags.model_input
         explicit_provider = parsed_flags.explicit_provider
@@ -8285,6 +8285,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
         force_refresh = parsed_flags.force_refresh
         is_session = parsed_flags.is_session
         one_turn = parsed_flags.is_once
+        force_model = parsed_flags.is_force
         if is_global_flag and one_turn:
             _cprint("  ✗ /model --once cannot be combined with --global")
             return
@@ -8377,6 +8378,7 @@ class HermesCLI(CLIAgentSetupMixin, CLICommandsMixin, CLIBillingMixin):
             explicit_provider=explicit_provider,
             user_providers=user_provs,
             custom_providers=custom_provs,
+            force=force_model,
         )
 
         if not result.success:

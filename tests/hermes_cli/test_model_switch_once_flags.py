@@ -20,3 +20,16 @@ def test_parse_model_flags_legacy_wrapper_strips_once():
     assert is_global is False
     assert force_refresh is False
     assert is_session is False
+
+
+def test_parse_model_flags_legacy_wrapper_keeps_five_tuple_with_force():
+    parsed = parse_model_flags("sonnet --force")
+
+    assert parsed == ("sonnet", "", False, False, False)
+
+
+def test_parse_model_flags_detailed_supports_force_and_unicode_dash():
+    parsed = parse_model_flags_detailed("sonnet \u2013force")
+
+    assert parsed.model_input == "sonnet"
+    assert parsed.is_force is True
