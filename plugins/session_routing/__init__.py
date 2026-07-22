@@ -133,6 +133,26 @@ def check_session_routing_requirements() -> bool:
         return False
 
 
+def _json_result_wrapper(handler):
+    """Wrap a tool handler so its return value passes the v0.19.0
+    ``ToolRegistry._normalize_handler_result`` contract.
+
+    v0.19.0 requires tool results to be ``str`` or the multimodal
+    envelope.  Our handlers return plain dicts.  This wrapper
+    serializes dicts to JSON strings before they reach dispatch.
+    """
+    import functools
+    import json as _json
+
+    @functools.wraps(handler)
+    def wrapped(*args, **kwargs):
+        result = handler(*args, **kwargs)
+        if isinstance(result, str):
+            return result
+        return _json.dumps(result, ensure_ascii=False)
+
+    return wrapped
+
 def register(ctx) -> None:
     """Register the model tools + gateway lifecycle hooks."""
 
@@ -141,7 +161,7 @@ def register(ctx) -> None:
             name=name,
             toolset="session_routing",
             schema=schema,
-            handler=handler,
+            handler=_json_result_wrapper(handler),
             check_fn=check_session_routing_requirements,
             emoji=emoji,
         )
