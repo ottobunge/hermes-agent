@@ -1,0 +1,9 @@
+name: wakeword
+label: Wakeword
+kind: platform
+version: 1.0.0
+description: Local USB-mic wake-word gateway adapter for Hermes Agent.
+author: Conrad and Hermes Agent
+provides_hooks:
+  - on_gateway_start
+  - on_gateway_stop
