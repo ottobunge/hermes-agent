@@ -2,7 +2,8 @@ from __future__ import annotations
 
 import hashlib
 import re
-from dataclasses import dataclass
+from collections import OrderedDict
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from email import policy
 from email.parser import BytesParser
@@ -38,6 +39,8 @@ class EventAdapter(Protocol):
 class HandlerContext:
     secret: bytes
     adapter: EventAdapter
+    seen_nonces: OrderedDict[tuple[str, int], None] = field(
+        default_factory=OrderedDict, compare=False, repr=False)
 
 
 def device_chat_id(device_id: str) -> str:
@@ -109,8 +112,6 @@ def build_event(adapter: EventAdapter, form: InjectionForm) -> MessageEvent:
         metadata={
             "origin": "wakeword",
             "device": form.device_id,
-            "correlation_id": form.correlation_id,
-            "captured_at": form.captured_at,
         },
         timestamp=timestamp)
 
@@ -119,23 +120,31 @@ async def handle_inject(request: web.Request) -> web.Response:
     """Authenticate and dispatch one daemon capture through the adapter."""
     signature = request.headers.get("X-Hermes-Wakeword-Key", "")
     raw_timestamp = request.headers.get("X-Hermes-Wakeword-Ts", "")
+    nonce = request.headers.get("X-Hermes-Wakeword-Nonce", "")
     try:
         timestamp = int(raw_timestamp)
     except ValueError as exc:
         raise web.HTTPUnauthorized(reason="invalid wakeword timestamp") from exc
     body = await request.read()
     context: HandlerContext = request.app["ctx"]
-    if not signature or not verify_signature(
-        context.secret, body, timestamp, signature, max_age_seconds=30
+    valid_nonce = re.fullmatch(r"[0-9a-f]{32}", nonce) is not None
+    if not signature or not valid_nonce or not verify_signature(
+        context.secret, body, timestamp, nonce, signature, max_age_seconds=30
     ):
         raise web.HTTPUnauthorized(reason="hmac mismatch or stale timestamp")
+    replay_key = (nonce, timestamp)
+    if replay_key in context.seen_nonces:
+        raise web.HTTPUnauthorized(reason="replayed wakeword request")
+    context.seen_nonces[replay_key] = None
+    if len(context.seen_nonces) > 1024:
+        context.seen_nonces.popitem(last=False)
     form = parse_form(request.headers.get("Content-Type", ""), body)
     event = build_event(context.adapter, form)
     await context.adapter.handle_message(event)
     return web.json_response({
         "chat_id": event.source.chat_id,
-        "correlation_id": event.metadata["correlation_id"], "queued": True,
-    })
+        "correlation_id": event.message_id, "queued": True,
+    }, status=202)
 
 
 def create_app(context: HandlerContext) -> web.Application:

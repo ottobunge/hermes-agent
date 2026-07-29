@@ -5,9 +5,9 @@ import hmac
 import stat
 import time
 from pathlib import Path
-def compute_signature(secret: bytes, body: bytes, ts: int) -> str:
-    """Return HMAC-SHA256 over the multipart body and timestamp."""
-    payload = body + b":" + str(ts).encode("ascii")
+def compute_signature(secret: bytes, body: bytes, ts: int, nonce: str) -> str:
+    """Return HMAC-SHA256 over the multipart body, timestamp, and nonce."""
+    payload = body + b":" + str(ts).encode("ascii") + b":" + nonce.encode("ascii")
     return hmac.new(secret, payload, hashlib.sha256).hexdigest()
 
 
@@ -15,15 +15,16 @@ def verify_signature(
     secret: bytes,
     body: bytes,
     ts: int,
+    nonce: str,
     given: str,
     *,
     max_age_seconds: int | None = None,
 ) -> bool:
-    """Verify body coverage and, when requested, timestamp freshness."""
+    """Verify body, timestamp, nonce, and optional timestamp freshness."""
     stale = max_age_seconds is not None and abs(time.time() - ts) > max_age_seconds
     if stale:
         return False
-    return hmac.compare_digest(compute_signature(secret, body, ts), given)
+    return hmac.compare_digest(compute_signature(secret, body, ts, nonce), given)
 
 
 def load_secret(path: Path) -> bytes | None:
