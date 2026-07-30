@@ -33,14 +33,14 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from plugins.session_routing import address as _address
-from plugins.session_routing import presence as _presence
-from plugins.session_routing.dispatcher import BackChannelDispatcher
-from plugins.session_routing.inbox import (
+from plugins.session_bus import address as _address
+from plugins.session_bus import presence as _presence
+from plugins.session_bus.dispatcher import BackChannelDispatcher
+from plugins.session_bus.inbox import (
     DEFAULT_HEALTH_THRESHOLD_SECONDS,
     InboxRunner,
 )
-from plugins.session_routing.nats_client import DEFAULT_HEARTBEAT_SECONDS
+from plugins.session_bus.nats_client import DEFAULT_HEARTBEAT_SECONDS
 
 logger = logging.getLogger(__name__)
 
@@ -379,7 +379,7 @@ class SessionRoutingRuntime:
         task.add_done_callback(self._cleanup_tasks.discard)
 
     async def _close_session_channels(self, session_id: str) -> None:
-        from plugins.session_routing.channels import close_channels_for_session
+        from plugins.session_bus.channels import close_channels_for_session
 
         my_address = self._address_for_session_id(session_id)
         try:

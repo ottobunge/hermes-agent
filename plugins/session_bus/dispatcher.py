@@ -43,13 +43,13 @@ import inspect
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
-from plugins.session_routing import address as _address
-from plugins.session_routing import channels as _channels
-from plugins.session_routing import handshake as _handshake
-from plugins.session_routing import protocol as _protocol
-from plugins.session_routing import routing as _routing
-from plugins.session_routing.channels import ChannelState
-from plugins.session_routing.nats_client import (
+from plugins.session_bus import address as _address
+from plugins.session_bus import channels as _channels
+from plugins.session_bus import handshake as _handshake
+from plugins.session_bus import protocol as _protocol
+from plugins.session_bus import routing as _routing
+from plugins.session_bus.channels import ChannelState
+from plugins.session_bus.nats_client import (
     NATSRoutingClient,
     NATSRoutingUnreachable,
 )

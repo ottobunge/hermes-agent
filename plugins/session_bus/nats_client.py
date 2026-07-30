@@ -60,7 +60,7 @@ DEFAULT_PUBLISH_TIMEOUT = 5.0
 class NATSRoutingUnreachable(Exception):
     """Raised when the broker is unreachable, auth fails, or pub/sub rejects.
 
-    Caught by the tool handlers in plugins.session_routing.tools and
+    Caught by the tool handlers in plugins.session_bus.tools and
     converted to a structured ``{"ok": False, "error": "broker_unreachable"}``
     result for the model.
     """
@@ -91,6 +91,10 @@ class NATSRoutingClient:
         self._kv_presence = None
         self._kv_allow = None
         self._kv_channels = None
+        # Default durable consumer name template for bus_observe pulls.
+        # Subject strings are sanitized (`.` -> `_`) because NATS consumer
+        # names can't contain dots or wildcards.
+        self._consumer_template = lambda subj: f"{name}-{_sanitize(subj)}"
 
     # ------------------------------------------------------------------
     # Lifecycle
@@ -591,6 +595,128 @@ class NATSRoutingClient:
         finally:
             await self.close()
 
+    # ------------------------------------------------------------------
+    # Broadcast (bus_emit / bus_observe)
+    # ------------------------------------------------------------------
+    # These two methods are the broadcast-side surface — they coexist
+    # with the routing methods (publish_routed, KV ops) on the same
+    # client because both share the same JetStream stream "SESSIONS".
+    # The unified plugin uses one client for everything.
+
+    async def publish(
+        self,
+        *,
+        subject: str,
+        payload: Dict[str, Any],
+        headers: Optional[Dict[str, str]] = None,
+        timeout: float = 5.0,
+    ) -> Dict[str, Any]:
+        """Publish a typed event to a broadcast subject. Returns ack info.
+
+        Used by bus_emit. Subject is the FULL subject (the caller is
+        responsible for the `from.<HERMES_AGENT_ID>.` prefix — see
+        broadcast.handle_emit). Headers are NATS message headers, not
+        HTTP-style.
+        """
+        if self._js is None:
+            raise NATSRoutingUnreachable("not connected")
+        body = json.dumps(payload, ensure_ascii=False,
+                          separators=(",", ":")).encode("utf-8")
+
+        async def _do() -> Any:
+            return await self._js.publish(
+                subject=subject,
+                payload=body,
+                headers=headers or None,
+                timeout=timeout,
+            )
+
+        try:
+            ack = await asyncio.wait_for(_do(), timeout=timeout + 1.0)
+        except Exception as e:
+            raise NATSRoutingUnreachable(f"publish failed: {e!r}") from e
+        return {
+            "seq": getattr(ack, "sequence", None),
+            "stream": getattr(ack, "stream", STREAM_NAME),
+        }
+
+    async def observe(
+        self,
+        *,
+        subject: str,
+        mode: str = "latest",
+        limit: int = 1,
+        timeout: float = 5.0,
+        consumer: Optional[str] = None,
+    ) -> List[Dict[str, Any]]:
+        """Pull up to `limit` messages from a JetStream subject pattern.
+
+        Used by bus_observe. The consumer is durable — calling again
+        advances the broker's cursor, and a fresh gateway session
+        resumes from the last seq. Returns a list of message dicts in
+        receive order, each ack'd before return.
+
+        ``mode="latest"`` returns immediately with up to ``limit``
+        pending messages (or empty list if the queue is empty).
+        ``mode="stream"`` blocks up to ``timeout`` for the first batch.
+        """
+        if self._js is None:
+            raise NATSRoutingUnreachable("not connected")
+
+        consumer_name = consumer or self._consumer_template(subject)
+
+        # Durable consumer; ack_policy=explicit so we control acks,
+        # deliver_policy=all means we replay anything pending from a
+        # previous run, not just new publishes.
+        try:
+            sub = await self._js.pull_subscribe(
+                subject=subject,
+                durable=consumer_name,
+                config={
+                    "ack_policy": "explicit",
+                    "deliver_policy": "all",
+                    "max_waiting": 1,
+                },
+            )
+        except Exception as e:  # noqa: BLE001
+            raise NATSRoutingUnreachable(
+                f"subscribe failed for {subject!r}: {e!r}"
+            ) from e
+
+        wait_ms = int(timeout * 1000) if mode == "stream" else 0
+        try:
+            msgs = await sub.fetch(
+                batch=limit,
+                timeout=wait_ms / 1000 if wait_ms else 0.05,
+            )
+        except Exception as e:  # noqa: BLE001
+            # Empty queue is a TimeoutError in nats-py, mapped to "no msg".
+            logger.debug("session_bus: fetch returned empty: %s", e)
+            msgs = []
+
+        out: List[Dict[str, Any]] = []
+        for msg in msgs:
+            try:
+                payload = json.loads(msg.data.decode("utf-8"))
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                payload = {"raw": msg.data.decode(errors="replace")}
+            out.append({
+                "subject": msg.subject,
+                "seq": getattr(msg, "sequence", None),
+                "headers": getattr(msg, "header", None) or {},
+                "payload": payload,
+            })
+            # Ack so a slow model that retries doesn't see duplicates.
+            try:
+                await msg.ack()
+            except Exception as e:  # noqa: BLE001
+                logger.warning(
+                    "session_bus: ack failed for seq %s (will redeliver): %s",
+                    getattr(msg, "sequence", "?"), e,
+                )
+
+        return out
+
 
 # ---------------------------------------------------------------------------
 # Module-level helpers (no broker needed) — useful for callers / tests
@@ -621,3 +747,25 @@ def is_fresh(presence_json: Dict[str, Any], *, ttl_seconds: int, now: Optional[f
         return False
     now = now if now is not None else time.time()
     return (now - last_seen) <= ttl_seconds
+
+
+# Unified-plugin alias: the old session-routing class is now the only NATS
+# client in the session-bus plugin (broadcast + routing share it).
+# External imports (plugins.session_bus.tools.broadcast) refer to it as
+# SessionBusClient.
+SessionBusClient = NATSRoutingClient
+
+
+def _sanitize(subject: str) -> str:
+    """Make a subject string safe for use as a NATS consumer name.
+
+    NATS consumer names cannot contain `.` or `*` or `>`. We replace
+    `.` with `_` (since subject dots have segment boundaries, treating
+    them as underscores preserves visual hierarchy) and replace `*`
+    and `>` with `+` and `-` respectively.
+    """
+    return (
+        subject.replace(".", "_")
+        .replace("*", "+")
+        .replace(">", "-")
+    )

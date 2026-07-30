@@ -33,8 +33,8 @@ import logging
 import time
 from typing import Any, Dict, List, Optional
 
-from plugins.session_routing.address import encode_subject
-from plugins.session_routing.nats_client import (
+from plugins.session_bus.address import encode_subject
+from plugins.session_bus.nats_client import (
     NATSRoutingClient,
     NATSRoutingUnreachable,
     is_fresh,
@@ -180,7 +180,7 @@ async def resolve_target(
     which is exactly what we want for ``session_route_send`` to fail
     closed with a structured ``no_live_session_for_address`` error.
     """
-    from plugins.session_routing.address import parse  # local import keeps
+    from plugins.session_bus.address import parse  # local import keeps
     # address.py importable without broker deps.
 
     gateway_id, session_key = parse(address)

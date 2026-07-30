@@ -180,7 +180,7 @@ async def load_channel(
     *, servers: List[str], channel_id: str
 ) -> Optional[Dict[str, Any]]:
     """Read one channel row by its wire-format id (sanitized here)."""
-    from plugins.session_routing.nats_client import NATSRoutingClient
+    from plugins.session_bus.nats_client import NATSRoutingClient
 
     async with NATSRoutingClient(servers=servers) as client:
         return await client.read_channel(channel_id_to_kv_key(channel_id))
@@ -190,7 +190,7 @@ async def save_channel(
     *, servers: List[str], record: Dict[str, Any]
 ) -> None:
     """Persist one channel row (key derived from record['channel_id'])."""
-    from plugins.session_routing.nats_client import NATSRoutingClient
+    from plugins.session_bus.nats_client import NATSRoutingClient
 
     channel_id = record["channel_id"]
     async with NATSRoutingClient(servers=servers) as client:
@@ -203,7 +203,7 @@ async def channels_for_session(
     *, servers: List[str], session_id: str
 ) -> List[Dict[str, Any]]:
     """All channel rows whose local session is ``session_id``."""
-    from plugins.session_routing.nats_client import NATSRoutingClient
+    from plugins.session_bus.nats_client import NATSRoutingClient
 
     async with NATSRoutingClient(servers=servers) as client:
         rows = await client.list_channels()
@@ -225,10 +225,10 @@ async def close_channels_for_session(
     of channels closed. Best-effort: a bye publish failure still closes
     the local row — the peer's liveness checks are the backstop.
     """
-    from plugins.session_routing import address as _address
-    from plugins.session_routing import handshake as _handshake
-    from plugins.session_routing import routing as _routing
-    from plugins.session_routing.nats_client import NATSRoutingClient
+    from plugins.session_bus import address as _address
+    from plugins.session_bus import handshake as _handshake
+    from plugins.session_bus import routing as _routing
+    from plugins.session_bus.nats_client import NATSRoutingClient
 
     closed = 0
     async with NATSRoutingClient(servers=servers) as client:

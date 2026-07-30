@@ -1,177 +1,41 @@
-"""session-routing plugin — addressed message routing between Hermes sessions.
+"""DEPRECATED — see plugins/session_bus/.
 
-Companion to ``session-bridge``: that plugin is broadcast / observe for
-typed events; this one is point-to-point delivery addressed by
-``<gateway_id>/<session_key>``. Both share the same NATS JetStream
-stream (``SESSIONS``) so installing one does NOT double-quota the
-operator's broker.
+This plugin (session_routing) has been merged into ``session-bus`` (v1.0.0).
+All six model tools now live under the unified plugin:
 
-Three model tools:
+    broadcast toolsets  -> bus_emit, bus_observe
+    routing    toolsets -> bus_handle, bus_route_send, bus_route_list, bus_establish
 
-  - ``session_handle``       — return THIS session's canonical address
-                               so the agent can hand it to a peer.
-  - ``session_route_send``   — publish a routed message to a peer.
-                               Recipient's allow-list is broker-side
-                               enforced (the subscriber only matches
-                               subjects from trusted gateway_ids).
-  - ``session_routing_list`` — enumerate live sessions, freshness-filtered.
+This directory remains for one minor cycle so existing operator configs
+that reference the old plugin keep loading. The ``register`` function
+below registers the new tools under their new names with a one-shot
+DeprecationWarning so any running skill or prompt that calls the old
+names will see a clear upgrade signal in the gateway log.
 
-v0.3.0 adds the full back-channel protocol:
-
-  - ``session_establish``    — 3-way handshake opening a typed channel
-                               to a peer session (tools.py).
-  - Gateway lifecycle wiring — ``on_gateway_start`` starts the presence
-                               heartbeat (one row per gateway with ALL
-                               live session_keys) and the deferred-ack
-                               ``InboxRunner`` feeding the receive-side
-                               ``BackChannelDispatcher`` (runtime.py).
-  - ``on_gateway_stop``      — stops both before the agent drain.
-  - ``on_session_finalize``  — closes (handshake.bye) every open channel
-                               owned by the finalized session.
-
-Scope:
-  - No auth (LAN + Courier VPN is the access boundary).
-  - One JetStream stream (reused from session-bridge), three KV buckets
-    (``session_presence``, ``session_allow``, ``session_channels``).
-
-Versioning: v0.3.0.
+The old tool names (``session_emit`` etc.) are NOT registered anymore --
+they were renamed to ``bus_*``. Update your skills/prompts to call the
+new names. See ``plugins/session_bus/README.md`` for the rename map.
 """
-
-from __future__ import annotations
-
-import logging
-import os
-from typing import Any, Dict, List
-
-from plugins.session_routing import tools as _tools
-
-logger = logging.getLogger(__name__)
+import warnings as _warnings
 
 
-_TOOLS = (
-    (
-        "session_handle",
-        _tools.SESSION_HANDLE_SCHEMA,
-        _tools.handle_session_handle,
-        "📍",
-    ),
-    (
-        "session_route_send",
-        _tools.SESSION_ROUTE_SEND_SCHEMA,
-        _tools.handle_session_route_send,
-        "✉️",
-    ),
-    (
-        "session_routing_list",
-        _tools.SESSION_ROUTING_LIST_SCHEMA,
-        _tools.handle_session_routing_list,
-        "📋",
-    ),
-    (
-        "session_inbox_status",
-        _tools.SESSION_INBOX_STATUS_SCHEMA,
-        _tools.handle_session_inbox_status,
-        "💓",
-    ),
-    (
-        "session_establish",
-        _tools.SESSION_ESTABLISH_SCHEMA,
-        _tools.handle_session_establish,
-        "🤝",
-    ),
-)
+_warned = [False]
 
 
-def _broker_servers() -> List[str]:
-    """Resolve NATS server list. Mirrors session-bridge's precedence."""
-    raw = (
-        os.environ.get("HERMES_NATS_URLS")
-        or os.environ.get("NATS_URLS")
-        or "nats://127.0.0.1:4222"
+def _maybe_warn_once() -> None:
+    if _warned[0]:
+        return
+    _warned[0] = True
+    _warnings.warn(
+        "session-bridge and session-routing are deprecated; install "
+        "session-bus instead. Tools renamed from session_* to bus_*. "
+        "See plugins/session_bus/README.md.",
+        DeprecationWarning,
+        stacklevel=3,
     )
-    return [s.strip() for s in raw.split(",") if s.strip()]
 
-
-def check_session_routing_requirements() -> bool:
-    """Service gate: tools only appear in the schema when NATS is reachable.
-
-    Three gates mirror session-bridge:
-
-      1. The optional ``nats-py`` dep is importable. Without it the
-         plugin still loads (the plugin.yaml ships to users without
-         nats-py installed), but the tools stay hidden so the model
-         doesn't see a tool that would explode at call-time.
-      2. ``HERMES_NATS_URLS`` or ``NATS_URLS`` is set, OR we fall back
-         to the loopback default. Operators who run the broker on a
-         different host MUST set the env var; the default is for
-         single-host LAN deployments.
-      3. ``NATSRoutingClient(...).ping(timeout=1.0)`` returns True.
-         A real broker round-trip — gateway hides the tool when the
-         broker is down so the model gets a stable "tool not
-         available" instead of a noisy failure mid-turn.
-    """
-    try:
-        import nats  # noqa: F401
-    except ImportError:
-        return False
-
-    if not (
-        os.environ.get("HERMES_NATS_URLS")
-        or os.environ.get("NATS_URLS")
-    ):
-        return False
-
-    try:
-        import asyncio
-        from plugins.session_routing.nats_client import NATSRoutingClient
-        servers = _broker_servers()
-        return asyncio.run(
-            NATSRoutingClient(servers=servers).ping(timeout=1.0)
-        )
-    except Exception as e:  # noqa: BLE001 — true "any failure is offline"
-        logger.debug("session_routing: NATS ping failed: %s", e)
-        return False
-
-
-def _json_result_wrapper(handler):
-    """Wrap a tool handler so its return value passes the v0.19.0
-    ``ToolRegistry._normalize_handler_result`` contract.
-
-    v0.19.0 requires tool results to be ``str`` or the multimodal
-    envelope.  Our handlers return plain dicts.  This wrapper
-    serializes dicts to JSON strings before they reach dispatch.
-    """
-    import functools
-    import json as _json
-
-    @functools.wraps(handler)
-    def wrapped(*args, **kwargs):
-        result = handler(*args, **kwargs)
-        if isinstance(result, str):
-            return result
-        return _json.dumps(result, ensure_ascii=False)
-
-    return wrapped
 
 def register(ctx) -> None:
-    """Register the model tools + gateway lifecycle hooks."""
-
-    for name, schema, handler, emoji in _TOOLS:
-        ctx.register_tool(
-            name=name,
-            toolset="session_routing",
-            schema=schema,
-            handler=_json_result_wrapper(handler),
-            check_fn=check_session_routing_requirements,
-            emoji=emoji,
-        )
-
-    # Lifecycle wiring (v0.3.0): the gateway awaits awaitable returns
-    # from on_gateway_start/stop; on_session_finalize schedules its own
-    # cleanup task. All failures are contained in runtime.py — a downed
-    # broker never blocks gateway startup/shutdown.
-    from plugins.session_routing.runtime import runtime
-
-    ctx.register_hook("on_gateway_start", runtime.on_gateway_start)
-    ctx.register_hook("on_gateway_stop", runtime.on_gateway_stop)
-    ctx.register_hook("on_session_finalize", runtime.on_session_finalize)
+    _maybe_warn_once()
+    from plugins.session_bus import register as _new_register
+    _new_register(ctx)

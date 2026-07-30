@@ -29,7 +29,7 @@ import os
 from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
-from plugins.session_routing.nats_client import NATSRoutingClient
+from plugins.session_bus.nats_client import NATSRoutingClient
 
 logger = logging.getLogger(__name__)
 

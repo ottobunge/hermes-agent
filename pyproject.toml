@@ -1,6 +1,12 @@
 # PEP 639 SPDX license expression (`license = "MIT"` below) requires
 # setuptools>=77. Keep this floor in lockstep with the `license` form in
 # [project]; an older build backend rejects the string form.
+
+# session-bus -- single optional dep for the unified inter-agent
+# bus plugin (replaces session-bridge + session-routing). Six tools
+# gated by `check_fn` until the NATS broker is reachable.
+session-bus = ["nats-py==2.15.0"]
+
 [build-system]
 requires = ["setuptools>=77.0,<83"]
 build-backend = "setuptools.build_meta"
@@ -221,13 +227,11 @@ acp = ["agent-client-protocol==0.9.0"]
 # don't run their own JetStream instance on day one; the plugin's
 # ``check_fn`` hides ``session_emit``/``session_observe`` from the schema
 # until the broker is reachable. See ``plugins/session-bridge/``.
-session-bridge = ["nats-py==2.15.0"]  # exact pin — match plugin's ``check_fn`` log
 # Point-to-point addressed routing between Hermes sessions. Same broker
 # as session-bridge, same dep. Three model tools (session_handle,
 # session_route_send, session_routing_list) gated by ``check_fn`` until
 # the broker is reachable. Allow-list of trusted gateway_ids lives in
 # ``~/.hermes/config.yaml`` (NOT in .env — see plugins/session-routing/).
-session-routing = ["nats-py==2.15.0"]  # same pin as session-bridge
 # tools/lazy_deps.py (stt.mistral / tts.mistral) at first use — deliberately
 # NOT re-added to [all] so a future quarantined release can't break fresh
 # installs (see [all] policy comment below).

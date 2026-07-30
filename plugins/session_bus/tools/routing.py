@@ -2,12 +2,12 @@
 
 Three tools are exposed to the model:
 
-  - ``session_handle``        — returns THIS session's canonical address
+  - ``bus_handle``        — returns THIS session's canonical address
                                 (no broker call). Lets the agent say
                                 "here's how you reach me" without any
                                 network round trip.
 
-  - ``session_route_send``    — delivers a typed payload to another
+  - ``bus_route_send``    — delivers a typed payload to another
                                 session by canonical address. Validates
                                 the address, checks presence, builds
                                 the envelope, and publishes to the
@@ -15,7 +15,7 @@ Three tools are exposed to the model:
                                 subscribed to. The recipient's allow-
                                 list is broker-side enforced.
 
-  - ``session_routing_list``  — enumerates live sessions whose
+  - ``bus_route_list``  — enumerates live sessions whose
                                 presence heartbeat is fresh. Used by
                                 discovery flows ("who can I talk to?").
 
@@ -38,9 +38,9 @@ import logging
 import os
 from typing import Any, Dict, List, Optional
 
-from plugins.session_routing import address, presence, protocol, routing
-from plugins.session_routing.allow import read_presence_ttl_seconds
-from plugins.session_routing.nats_client import (
+from plugins.session_bus import address, presence, protocol, routing
+from plugins.session_bus.allow import read_presence_ttl_seconds
+from plugins.session_bus.nats_client import (
     NATSRoutingClient,
     NATSRoutingUnreachable,
     DEFAULT_PRESENCE_TTL_SECONDS,
@@ -53,8 +53,8 @@ logger = logging.getLogger(__name__)
 # Schemas
 # ---------------------------------------------------------------------------
 
-SESSION_HANDLE_SCHEMA: Dict[str, Any] = {
-    "name": "session_handle",
+HANDLE_SCHEMA: Dict[str, Any] = {
+    "name": "bus_handle",
     "description": (
         "Identify this session so it can be referenced by a peer agent. "
         "Use this when the operator asks 'what's my session id', 'share "
@@ -72,13 +72,13 @@ SESSION_HANDLE_SCHEMA: Dict[str, Any] = {
 }
 
 
-SESSION_ROUTE_SEND_SCHEMA: Dict[str, Any] = {
-    "name": "session_route_send",
+ROUTE_SEND_SCHEMA: Dict[str, Any] = {
+    "name": "bus_route_send",
     "description": (
         "Deliver a typed message to another live Hermes session. "
         "`target` is the recipient's canonical address "
         "('<gateway_id>/<session_key>') — obtained previously from "
-        "session_handle or session_routing_list. `content` is a "
+        "bus_handle or bus_route_list. `content` is a "
         "JSON-serializable dict (the message body). `reply_to` is an "
         "optional caller-chosen token the recipient can echo back so "
         "the agent can correlate reply streams. Returns "
@@ -119,17 +119,17 @@ SESSION_ROUTE_SEND_SCHEMA: Dict[str, Any] = {
 }
 
 
-SESSION_ESTABLISH_SCHEMA: Dict[str, Any] = {
-    "name": "session_establish",
+ESTABLISH_SCHEMA: Dict[str, Any] = {
+    "name": "bus_establish",
     "description": (
         "Open (or reuse) a typed back-channel to another live Hermes "
         "session via a 3-way handshake. `target` is the peer's "
         "canonical address ('<gateway_id>/<session_key>', from "
-        "session_routing_list or handed over by the user). Blocks up "
+        "bus_route_list or handed over by the user). Blocks up "
         "to `timeout_seconds` waiting for the peer's ack. Returns "
         "{ok: true, channel_id, peer_address, established_at, "
         "peer_capabilities} on success — after which "
-        "session_route_send delivers visible messages the peer's user "
+        "bus_route_send delivers visible messages the peer's user "
         "sees in their chat. Idempotent: re-establishing to the same "
         "target returns the existing channel. On failure returns "
         "{ok: false, error: rejected|timeout|broker_unreachable|"
@@ -175,8 +175,8 @@ SESSION_ESTABLISH_SCHEMA: Dict[str, Any] = {
 }
 
 
-SESSION_ROUTING_LIST_SCHEMA: Dict[str, Any] = {
-    "name": "session_routing_list",
+ROUTE_LIST_SCHEMA: Dict[str, Any] = {
+    "name": "bus_route_list",
     "description": (
         "Enumerate live Hermes sessions known to the broker, "
         "optionally filtered by gateway_id. Each entry includes the "
@@ -203,7 +203,7 @@ SESSION_ROUTING_LIST_SCHEMA: Dict[str, Any] = {
 
 
 SESSION_INBOX_STATUS_SCHEMA: Dict[str, Any] = {
-    "name": "session_inbox_status",
+    "name": "bus_inbox_status",
     "description": (
         "Operator-visibility tool for the local session-routing inbox "
         "consumer. Returns the runtime's view of the inbox runner: "
@@ -274,7 +274,7 @@ def _run_async(coro):
 # Handlers
 # ---------------------------------------------------------------------------
 
-def handle_session_handle(
+def handle_bus_handle(
     args: Optional[Dict[str, Any]] = None,
     **_kwargs: Any,
 ) -> Dict[str, Any]:
@@ -313,7 +313,7 @@ def handle_session_handle(
             f"  gateway_id: `{gateway_id}`\n"
             f"  session_key: `{session_key}`\n"
             "You can use this to start a back-channel with me by asking "
-            "another agent to `session_establish` targeting this address."
+            "another agent to `bus_establish` targeting this address."
         ),
     }
 
@@ -331,7 +331,7 @@ def _notify_outbound(target: str, body: str) -> None:
     if not session_key:
         return
     try:
-        from plugins.session_routing import runtime as _runtime
+        from plugins.session_bus import runtime as _runtime
 
         _runtime.publish_notification_threadsafe(
             session_key,
@@ -344,7 +344,7 @@ def _notify_outbound(target: str, body: str) -> None:
         )
 
 
-def handle_session_route_send(
+def handle_bus_route_send(
     args: Optional[Dict[str, Any]] = None,
     target: Optional[str] = None,
     content: Optional[Dict[str, Any]] = None,
@@ -466,10 +466,10 @@ def handle_session_route_send(
     try:
         result = _run_async(_send())
     except NATSRoutingUnreachable as e:
-        logger.warning("session_route_send: broker unreachable: %s", e)
+        logger.warning("bus_route_send: broker unreachable: %s", e)
         return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
     except Exception as e:  # noqa: BLE001
-        logger.exception("session_route_send failed")
+        logger.exception("bus_route_send failed")
         return {"ok": False, "error": "send_failed", "detail": repr(e)}
 
     # Only chat-visible payloads get mirrored — protocol traffic
@@ -490,18 +490,18 @@ def _resolve_local_session_id(session_key: str) -> Optional[str]:
     """
     if session_key:
         try:
-            from plugins.session_routing.runtime import runtime
+            from plugins.session_bus.runtime import runtime
             gw = runtime._gateway
             if gw is not None:
                 entry = gw.session_store.get_entry(session_key)
                 if entry is not None and getattr(entry, "session_id", ""):
                     return entry.session_id
         except Exception as e:  # noqa: BLE001
-            logger.debug("session_establish: store lookup failed: %s", e)
+            logger.debug("bus_establish: store lookup failed: %s", e)
     return os.environ.get("HERMES_SESSION_ID", "").strip() or None
 
 
-def handle_session_establish(
+def handle_bus_establish(
     args: Optional[Dict[str, Any]] = None,
     target: Optional[str] = None,
     initial_message: Optional[str] = None,
@@ -532,9 +532,9 @@ def handle_session_establish(
     if not target:
         return {"ok": False, "error": "missing_arg", "detail": "target is required"}
 
-    from plugins.session_routing import channels as _channels
-    from plugins.session_routing import handshake as _handshake
-    from plugins.session_routing import protocol as _protocol
+    from plugins.session_bus import channels as _channels
+    from plugins.session_bus import handshake as _handshake
+    from plugins.session_bus import protocol as _protocol
 
     try:
         address.parse(target)
@@ -680,17 +680,17 @@ def handle_session_establish(
             return envelope["msg_id"]
         except NATSRoutingUnreachable as e:
             logger.warning(
-                "session_establish: initial_message publish failed: %s", e
+                "bus_establish: initial_message publish failed: %s", e
             )
             return None
 
     try:
         result = _run_async(_establish())
     except NATSRoutingUnreachable as e:
-        logger.warning("session_establish: broker unreachable: %s", e)
+        logger.warning("bus_establish: broker unreachable: %s", e)
         return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
     except Exception as e:  # noqa: BLE001
-        logger.exception("session_establish failed")
+        logger.exception("bus_establish failed")
         return {"ok": False, "error": "establish_failed", "detail": repr(e)}
 
     # Mirror the initial message only when it actually went out (its
@@ -700,7 +700,7 @@ def handle_session_establish(
     return result
 
 
-def handle_session_routing_list(
+def handle_bus_route_list(
     args: Optional[Dict[str, Any]] = None,
     gateway_id_filter: Optional[str] = None,
     **_kwargs: Any,
@@ -727,10 +727,10 @@ def handle_session_routing_list(
     try:
         live = _run_async(_list())
     except NATSRoutingUnreachable as e:
-        logger.warning("session_routing_list: broker unreachable: %s", e)
+        logger.warning("bus_route_list: broker unreachable: %s", e)
         return {"ok": False, "error": "broker_unreachable", "detail": str(e)}
     except Exception as e:  # noqa: BLE001
-        logger.exception("session_routing_list failed")
+        logger.exception("bus_route_list failed")
         return {"ok": False, "error": "list_failed", "detail": repr(e)}
 
     return {"ok": True, "live": live}
@@ -754,7 +754,7 @@ def handle_session_inbox_status(
     """
     # Imported here (not at module top) to keep this tool's import
     # graph tight — runtime.py pulls in the full dispatcher.
-    from plugins.session_routing.runtime import runtime as _runtime
+    from plugins.session_bus.runtime import runtime as _runtime
 
     status = _runtime.inbox_status()
     return {"ok": True, "status": status}

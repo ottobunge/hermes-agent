@@ -1,0 +1,61 @@
+name: session-bus
+version: 1.0.0
+kind: standalone
+description: >
+  Single NATS-based inter-agent bus for Hermes Agent. Replaces
+  session-bridge (broadcast) and session-routing (addressed) with one
+  unified plugin.
+
+  Two toolsets:
+    session_bus_broadcast (bus_emit, bus_observe)
+      Typed event bus. Per-tool ephemeral NATS connection. Auto-prefixes
+      every subject with `from.<HERMES_AGENT_ID>.`. Receivers must scope
+      their subscriptions to a single trusted sender — never use a
+      cross-sender wildcard.
+
+    session_bus_routing (bus_handle, bus_route_send, bus_route_list,
+                         bus_establish)
+      Addressed point-to-point delivery with handshake, KV presence,
+      recipient allow-list (broker-side enforced), and an inbox
+      subscriber that injects received envelopes as synthetic user turns.
+
+  One NATS JetStream stream ("SESSIONS"), two KV buckets
+  (session_presence, session_allow). Both toolsets share the same
+  broker connection.
+
+  Requires the optional `nats-py==2.15.0` Python dep (pulled via
+  `uv pip install '.[session-bus]'` or `hermes plugins install session-bus`).
+  Tools auto-hide from the schema when the broker is unreachable so the
+  agent sees "tool not available" instead of a noisy failure mid-turn.
+
+  Migrating from the old plugins:
+    session-bridge (session_emit, session_observe)
+    session-routing (session_handle, session_route_send,
+                     session_routing_list, session_establish)
+  See plugins/session_bus/README.md for the rename map and the soft-cut
+  deprecation shim that lets existing operator configs keep loading for
+  one minor cycle.
+author: OttoBunge
+platforms:
+  - linux
+  - macos
+provides_tools:
+  - bus_emit
+  - bus_observe
+  - bus_handle
+  - bus_route_send
+  - bus_route_list
+  - bus_establish
+toolsets:
+  session_bus_broadcast:
+    - bus_emit
+    - bus_observe
+  session_bus_routing:
+    - bus_handle
+    - bus_route_send
+    - bus_route_list
+    - bus_establish
+hooks:
+  - on_gateway_start
+  - on_gateway_stop
+  - on_session_finalize

@@ -152,7 +152,7 @@ def resolve_gateway_id(explicit: Optional[str] = None) -> str:
     # address.py is imported by allow.py only at startup, but we keep the
     # chain clean by importing inside the branch).
     try:
-        from plugins.session_routing.allow import read_config_gateway_id
+        from plugins.session_bus.allow import read_config_gateway_id
         cfg_val = read_config_gateway_id()
         if cfg_val:
             return cfg_val
@@ -260,7 +260,7 @@ def encode_subject(
     Recipients can subscribe to ``subject_filter_for(allowed_sender_gw)``
     to hear only the senders they trust.
     """
-    from plugins.session_routing.address import _check_no_forbidden
+    from plugins.session_bus.address import _check_no_forbidden
     if not verb or "." in verb:
         raise AddressError(f"verb must be a single token, got {verb!r}")
     _check_no_forbidden(sender_gateway_id, "sender_gateway_id")

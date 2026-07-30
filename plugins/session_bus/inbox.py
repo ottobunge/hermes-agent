@@ -46,8 +46,8 @@ import logging
 import time
 from typing import Any, Awaitable, Callable, Dict, List, Optional
 
-from plugins.session_routing.allow import effective_allow_list
-from plugins.session_routing.nats_client import (
+from plugins.session_bus.allow import effective_allow_list
+from plugins.session_bus.nats_client import (
     NATSRoutingClient,
     NATSRoutingUnreachable,
 )
